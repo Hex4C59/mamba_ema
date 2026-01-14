@@ -1,0 +1,43 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Training outputs
+runs/
+
+# Datasets
+data/*
+!data/README.md
+!data/.gitkeep
+
+# Configuration files
+configs/*
+!configs/README.md
+!configs/.gitkeep
+
+# Pretrained models
+pretrained_model/*
+!pretrained_model/README.md
+!pretrained_model/.gitkeep
+
+# Papers (ignore PDFs but keep notes)
+papers/pdfs/*.pdf
+!papers/pdfs/.gitkeep
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
