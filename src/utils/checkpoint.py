@@ -1,7 +1,7 @@
 """Checkpoint management for saving and loading model states."""
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +9,7 @@ import torch.optim as optim
 
 def save_checkpoint(
     state: Dict,
-    save_path: str,
+    save_path: Union[str, Path],
     is_best: bool = False,
 ) -> None:
     """Save model checkpoint.
@@ -21,7 +21,7 @@ def save_checkpoint(
             - optimizer_state_dict: dict
             - best_metric: float
             - config: dict
-        save_path: Path to save checkpoint
+        save_path: Path to save checkpoint (str or Path)
         is_best: If True, also save as best_model.pth
     """
     save_path = Path(save_path)
@@ -35,7 +35,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    load_path: str,
+    load_path: Union[str, Path],
     model: nn.Module,
     optimizer: Optional[optim.Optimizer] = None,
     strict: bool = True,
@@ -43,7 +43,7 @@ def load_checkpoint(
     """Load model checkpoint.
 
     Args:
-        load_path: Path to checkpoint
+        load_path: Path to checkpoint (str or Path)
         model: Model to load state into
         optimizer: Optional optimizer to load state into
         strict: If True, require exact key match

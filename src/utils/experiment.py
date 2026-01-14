@@ -44,7 +44,17 @@ def init_experiment(config: dict) -> Tuple[str, ExpLogger]:
     """
     # Create experiment directory
     base_dir = config.get("experiment", {}).get("base_dir", "runs")
-    exp_name = config.get("experiment", {}).get("name", None)
+    exp_name = config.get("experiment", {}).get("name", "exp")
+
+    # Add dataset and fold info to experiment name
+    dataset_name = config.get("data", {}).get("name", "unknown")
+    fold = config.get("data", {}).get("params", {}).get("fold", None)
+
+    # Build experiment name: {exp_name}_{dataset}_{fold}_{timestamp}
+    if fold is not None:
+        exp_name = f"{exp_name}_{dataset_name.lower()}_fold{fold}"
+    else:
+        exp_name = f"{exp_name}_{dataset_name.lower()}"
 
     exp_dir = create_exp_dir(base_dir, exp_name)
 

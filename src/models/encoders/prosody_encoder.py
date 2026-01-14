@@ -57,7 +57,9 @@ class ProsodyEncoder(nn.Module):
             if not feature_path.exists():
                 raise FileNotFoundError(f"Feature not found: {feature_path}")
 
-            feature = torch.load(feature_path, map_location=device)  # [d_input]
+            feature = torch.load(
+                feature_path, map_location=device, weights_only=True
+            )  # [d_input]
             features.append(feature)
 
         features = torch.stack(features)  # [B, d_input]

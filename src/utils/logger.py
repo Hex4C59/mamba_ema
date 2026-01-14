@@ -2,7 +2,6 @@
 
 from pathlib import Path
 from typing import Dict
-import csv
 import matplotlib.pyplot as plt
 from .config import save_yaml
 
@@ -24,16 +23,10 @@ class ExpLogger:
 
         # Initialize log files
         self.log_file = self.exp_dir / "train.log"
-        self.metrics_file = self.exp_dir / "metrics.csv"
-
-        # Initialize metrics CSV
-        with open(self.metrics_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "split", "loss", "ccc_v", "ccc_a", "ccc_avg"])
 
         # Storage for plotting
         self.train_metrics = {"epoch": [], "loss": []}
-        self.val_metrics = {"epoch": [], "ccc_v": [], "ccc_a": [], "ccc_avg": []}
+        self.val_metrics = {"epoch": [], "loss": [], "ccc_v": [], "ccc_a": [], "ccc_avg": []}
 
     def log(self, metrics: Dict[str, float], step: int, split: str) -> None:
         """Log metrics for a step.
@@ -43,25 +36,13 @@ class ExpLogger:
             step: Step number (epoch)
             split: "train" or "val"
         """
-        # Write to CSV
-        with open(self.metrics_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            row = [
-                step,
-                split,
-                metrics.get("loss", 0.0),
-                metrics.get("ccc_v", 0.0),
-                metrics.get("ccc_a", 0.0),
-                metrics.get("ccc_avg", 0.0),
-            ]
-            writer.writerow(row)
-
         # Store for plotting
         if split == "train":
             self.train_metrics["epoch"].append(step)
             self.train_metrics["loss"].append(metrics.get("loss", 0.0))
         elif split == "val":
             self.val_metrics["epoch"].append(step)
+            self.val_metrics["loss"].append(metrics.get("loss", 0.0))
             self.val_metrics["ccc_v"].append(metrics.get("ccc_v", 0.0))
             self.val_metrics["ccc_a"].append(metrics.get("ccc_a", 0.0))
             self.val_metrics["ccc_avg"].append(metrics.get("ccc_avg", 0.0))
@@ -90,42 +71,71 @@ class ExpLogger:
                 f.write(f"{key}: {value}\n")
 
     def plot_curves(self) -> None:
-        """Plot training curves."""
-        # Loss curve
+        """Plot and save training & validation loss curves + CCC metrics."""
+        # 1. Loss curve (CCC Loss = 1 - CCC, lower is better)
+        fig, ax = plt.subplots(figsize=(10, 6))
+
         if self.train_metrics["epoch"]:
-            plt.figure(figsize=(10, 6))
-            plt.plot(
+            ax.plot(
                 self.train_metrics["epoch"],
                 self.train_metrics["loss"],
-                label="Train Loss",
+                label="Train Loss (1 - CCC)",
+                marker='o',
+                linewidth=2
             )
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.title("Training Loss")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(self.exp_dir / "loss_curve.png")
-            plt.close()
-
-        # Metrics curve
         if self.val_metrics["epoch"]:
-            plt.figure(figsize=(10, 6))
-            plt.plot(
-                self.val_metrics["epoch"], self.val_metrics["ccc_v"], label="CCC-V"
+            ax.plot(
+                self.val_metrics["epoch"],
+                self.val_metrics["loss"],
+                label="Val Loss (1 - CCC)",
+                marker='s',
+                linewidth=2
             )
-            plt.plot(
-                self.val_metrics["epoch"], self.val_metrics["ccc_a"], label="CCC-A"
+        ax.set_xlabel("Epoch", fontsize=12)
+        ax.set_ylabel("CCC Loss (Lower is Better)", fontsize=12)
+        ax.set_title("Training & Validation CCC Loss", fontsize=14, fontweight='bold')
+        ax.legend(fontsize=11)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, 2])  # CCC Loss range: [0, 2]
+
+        plt.tight_layout()
+        plt.savefig(self.exp_dir / "loss_curve.png", dpi=100)
+        plt.close()
+
+        # 2. CCC metrics curve (validation only, higher is better)
+        if self.val_metrics["epoch"]:
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            ax.plot(
+                self.val_metrics["epoch"],
+                self.val_metrics["ccc_v"],
+                label="CCC-Valence",
+                marker='o',
+                linewidth=2
             )
-            plt.plot(
+            ax.plot(
+                self.val_metrics["epoch"],
+                self.val_metrics["ccc_a"],
+                label="CCC-Arousal",
+                marker='s',
+                linewidth=2
+            )
+            ax.plot(
                 self.val_metrics["epoch"],
                 self.val_metrics["ccc_avg"],
-                label="CCC-Avg",
+                label="CCC-Average",
+                marker='^',
                 linewidth=2,
+                linestyle='--'
             )
-            plt.xlabel("Epoch")
-            plt.ylabel("CCC")
-            plt.title("Validation CCC")
-            plt.legend()
-            plt.grid(True)
-            plt.savefig(self.exp_dir / "metrics_curve.png")
+
+            ax.set_xlabel("Epoch", fontsize=12)
+            ax.set_ylabel("CCC Score (Higher is Better)", fontsize=12)
+            ax.set_title("Validation CCC Metrics", fontsize=14, fontweight='bold')
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim([0, 1])  # CCC range: [-1, 1], but typically [0, 1] for good models
+
+            plt.tight_layout()
+            plt.savefig(self.exp_dir / "ccc_curve.png", dpi=100)
             plt.close()

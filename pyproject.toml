@@ -1,15 +1,13 @@
 [project]
-name = "deep-learning-template"
+name = "mamba_ema"
 version = "0.1.0"
-description = "template project"
+description = "mamba_emoa project"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
-    "torch==2.6.0",
-    "torchaudio==2.6.0",
-    "torchvision==0.21.0",
-    "torchcodec>=0.8.1",
-    "transformers>=4.40.0",
+    "torch==2.0.1",
+    "torchaudio==2.0.2",
+    "transformers==4.44.0",
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.34,<1.0",
     "librosa>=0.11.0",
@@ -25,12 +23,18 @@ dependencies = [
     "ipdb>=0.13.13",
     "opensmile>=2.6.0",
     "speechbrain>=1.0.3",
+    "torchvision==0.15.2",
+    "markupsafe==2.1.5",
+    "mamba-ssm==2.2.1",
+    "numpy<2.0.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/Hex4C59/deep_learning_template"
-Repository = "https://github.com/Hex4C59/deep_learning_template.git"
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+
