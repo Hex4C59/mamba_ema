@@ -9,6 +9,7 @@
 全局目录：/mnt/shareEEx/liuyang/resources/pretrained_model
 项目目录：<project_root>/pretrained_model
 """
+
 from __future__ import annotations
 
 import os
@@ -17,7 +18,6 @@ from pathlib import Path
 from typing import Dict
 
 from modelscope import snapshot_download
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GLOBAL_PRETRAINED = Path("/mnt/shareEEx/liuyang/resources/pretrained_model")
@@ -53,10 +53,7 @@ def _download_to_global(model_key: str, model_id: str) -> Path:
     print(f"[download] 开始下载 {model_key} ({model_id}) 到全局目录")
     print(f"[download] 目标路径: {global_dir}")
 
-    model_dir = snapshot_download(
-        model_id=model_id,
-        cache_dir=str(GLOBAL_PRETRAINED)
-    )
+    model_dir = snapshot_download(model_id=model_id, cache_dir=str(GLOBAL_PRETRAINED))
 
     print(f"[done] {model_key} 下载完成")
     print(f"[done] 模型路径: {model_dir}")
@@ -69,7 +66,7 @@ def _download_to_global(model_key: str, model_id: str) -> Path:
         subindent = " " * 2 * (level + 1)
         for file in files:
             file_path = os.path.join(root, file)
-            file_size = os.path.getsize(file_path) / (1024 ** 3)
+            file_size = os.path.getsize(file_path) / (1024**3)
             print(f"{subindent}{file} ({file_size:.2f} GB)")
 
     return Path(model_dir)
@@ -90,6 +87,7 @@ def download_and_link(model_key: str, model_id: str) -> None:
 
     # 在全局目录中查找已存在的模型
     import glob
+
     existing = list(Path(p) for p in glob.glob(str(global_pattern), recursive=True))
 
     if existing:
