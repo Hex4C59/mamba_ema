@@ -28,6 +28,7 @@ class IEMOCAPDataset(Dataset):
             - Remaining 3 sessions used as training set
         sample_rate: Target sample rate (default: 16000)
         normalize_vad: If True, normalize VAD to [0, 1] (default: True)
+        max_duration: If specified, truncate audio to this duration in seconds (default: None)
     """
 
     def __init__(
@@ -38,6 +39,7 @@ class IEMOCAPDataset(Dataset):
         fold: int = 1,
         sample_rate: int = 16000,
         normalize_vad: bool = True,
+        max_duration: float = None,
     ):
         self.label_file = label_file
         self.audio_root = Path(audio_root)
@@ -45,6 +47,7 @@ class IEMOCAPDataset(Dataset):
         self.fold = fold
         self.sample_rate = sample_rate
         self.normalize_vad = normalize_vad
+        self.max_duration = max_duration
 
         # Load and preprocess labels
         self.data = self._load_labels()
@@ -168,6 +171,12 @@ class IEMOCAPDataset(Dataset):
             waveform = resampler(waveform)
 
         waveform = waveform.squeeze(0)  # [T]
+
+        # Truncate to max_duration if specified
+        if self.max_duration is not None:
+            max_samples = int(self.max_duration * self.sample_rate)
+            if waveform.shape[0] > max_samples:
+                waveform = waveform[:max_samples]
 
         # Extract VAD labels
         valence = float(row["V"])

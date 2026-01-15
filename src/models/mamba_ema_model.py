@@ -8,34 +8,35 @@ import torch.nn as nn
 from .encoders.prosody_encoder import ProsodyEncoder
 from .encoders.speaker_encoder import SpeakerEncoder
 from .encoders.speech_encoder import SpeechEncoder
+from .modules.cross_attention import CrossAttention
 from .modules.ema import EMAState
 from .modules.film import FiLM
 from .modules.mamba_updater import MambaUpdater
-from .modules.cross_attention import CrossAttention
 
 
 class MambaEMAModel(nn.Module):
     def __init__(
         self,
         speech_encoder_name: str = "pretrained_model/wav2vec2-base",
-        d_speech: int = 768,
-        speech_encoder_layers: list = None,  # Multi-layer extraction
-        speech_encoder_pooling: str = "mean",  # Pooling method: "mean" or "attention"
+        d_speech: int = 1024,
+        speech_encoder_layers: list = None,  # speech encoder 提取哪些层数
+        speech_encoder_pooling: str = "mean",
         prosody_feature_dir: str = "data/features/IEMOCAP/egemaps",
-        d_prosody_in: int = 88,
-        d_prosody_out: int = 64,
-        speaker_encoder_name: str = "speechbrain/spkrec-ecapa-voxceleb",
-        d_speaker: int = 192,
-        d_hidden: int = 256,
-        dropout: float = 0.2,
-        use_ema: bool = False,
-        d_state: int = 64,
-        ema_alpha: float = 0.8,
-        mamba_d_model: int = 256,
-        mamba_n_layers: int = 2,
+        d_prosody_in: int = 88, # 韵律特征维度
+        d_prosody_out: int = 64, # 韵律编码器输出维度
+        speaker_encoder_name: str = "speechbrain/spkrec-ecapa-voxceleb", # 说话人编码器模型
+        d_speaker: int = 192, # 说话人嵌入维度
+        d_hidden: int = 256, # 模型隐藏层维度
+        dropout: float = 0.2, # dropout 比例
+        use_ema: bool = False, # 是否使用 EMA 状态
+        d_state: int = 64, # EMA 状态维度
+        ema_alpha: float = 0.8, # EMA 衰减系数
+        mamba_d_model: int = 256, # Mamba 模型维度
+        mamba_n_layers: int = 2, # Mamba 层数
         freeze_speech_encoder: bool = True,  # 控制是否冻结 speech encoder
         use_cross_attention: bool = False,  # 是否使用交叉注意力
         cross_attention_heads: int = 4,  # 交叉注意力头数
+        cross_attention_expand_query: bool = True,  # 交叉注意力是否扩展query到时序维度
     ) -> None:
         super().__init__()
         self.use_ema = use_ema
@@ -62,7 +63,6 @@ class MambaEMAModel(nn.Module):
             normalize=True,
         )
 
-        # FiLM modulation
         self.film = FiLM(speaker_dim=d_speaker, feat_dim=d_speech, hidden_dim=256)
 
         # Cross-attention: Prosody attends to Speech sequence
@@ -73,6 +73,7 @@ class MambaEMAModel(nn.Module):
                 d_hidden=d_hidden,
                 num_heads=cross_attention_heads,
                 dropout=dropout,
+                expand_query=cross_attention_expand_query,
             )
             # After cross-attention, we have d_hidden dimensional features
             d_fused = d_hidden
@@ -99,7 +100,7 @@ class MambaEMAModel(nn.Module):
             nn.Linear(d_head_input, d_hidden),
             nn.Tanh(),
             nn.Linear(d_hidden, 2),  # [prosody weight, other weight]
-            nn.Softmax(dim=-1)
+            nn.Softmax(dim=-1),
         )
 
         self.valence_head = nn.Sequential(
@@ -121,7 +122,7 @@ class MambaEMAModel(nn.Module):
             nn.Linear(d_head_input, d_hidden),
             nn.Tanh(),
             nn.Linear(d_hidden, 2),  # [speech weight, other weight]
-            nn.Softmax(dim=-1)
+            nn.Softmax(dim=-1),
         )
 
         self.arousal_head = nn.Sequential(
@@ -153,21 +154,23 @@ class MambaEMAModel(nn.Module):
 
         # Branch based on cross-attention usage
         if self.use_cross_attention:
-            # Get sequence features from speech encoder
+            # Get sequence features from speech encoder (frame-level)
             h_seq, padding_mask = self.speech_encoder(
                 waveforms, names, return_sequence=True
             )  # h_seq: [B, T, 1024], padding_mask: [B, T]
 
-            # Apply FiLM modulation to sequence
-            # Expand speaker embedding to sequence
-            s_expanded = s.unsqueeze(1).expand(-1, h_seq.size(1), -1)  # [B, T, 192]
-            h_seq_mod = torch.zeros_like(h_seq)
-            for t in range(h_seq.size(1)):
-                h_seq_mod[:, t, :] = self.film(h_seq[:, t, :], s_expanded[:, t, :])
+            # Apply FiLM modulation to sequence (vectorized)
+            # Expand speaker embedding to sequence: [B, 192] → [B, T, 192]
+            s_expanded = s.unsqueeze(1).expand(-1, h_seq.size(1), -1)
 
-            # Cross-attention: Prosody queries Speech sequence
+            # FiLM can handle [B, T, d] directly via broadcasting
+            h_seq_mod = self.film(h_seq, s_expanded)  # [B, T, 1024]
+
+            # Cross-attention: Prosody (Q) attends to modulated Speech (K, V)
             z = self.cross_attention(
-                query=p, key_value=h_seq_mod, key_padding_mask=padding_mask
+                query=p,                      # [B, 64] - Prosody as Query
+                key_value=h_seq_mod,          # [B, T, 1024] - Modulated speech as K/V
+                key_padding_mask=padding_mask
             )  # [B, d_hidden]
         else:
             # Original pooled features
@@ -194,14 +197,12 @@ class MambaEMAModel(nn.Module):
             # Original feature-wise weighting logic
             # Split features for separate weighting
             # head_input = [h_mod (speech), p (prosody), c_t (ema_state)]
-            speech_feat = head_input[:, :self.d_speech]  # [B, 1024]
+            speech_feat = head_input[:, : self.d_speech]  # [B, 1024]
             prosody_feat = head_input[
-                :, self.d_speech:self.d_speech + self.d_prosody_out
+                :, self.d_speech : self.d_speech + self.d_prosody_out
             ]  # [B, 64]
             if self.use_ema:
-                ema_feat = head_input[
-                    :, self.d_speech + self.d_prosody_out:
-                ]  # [B, d_state]
+                ema_feat = head_input[:, self.d_speech + self.d_prosody_out :]  # [B, d_state]
 
             # Valence: emphasize prosody features
             valence_weights = self.valence_attention(head_input)  # [B, 2]
@@ -217,9 +218,7 @@ class MambaEMAModel(nn.Module):
                     [weighted_speech_v, weighted_prosody_v, weighted_ema_v], dim=-1
                 )
             else:
-                valence_input = torch.cat(
-                    [weighted_speech_v, weighted_prosody_v], dim=-1
-                )
+                valence_input = torch.cat([weighted_speech_v, weighted_prosody_v], dim=-1)
 
             # Arousal: emphasize speech features
             arousal_weights = self.arousal_attention(head_input)  # [B, 2]
@@ -235,9 +234,7 @@ class MambaEMAModel(nn.Module):
                     [weighted_speech_a, weighted_prosody_a, weighted_ema_a], dim=-1
                 )
             else:
-                arousal_input = torch.cat(
-                    [weighted_speech_a, weighted_prosody_a], dim=-1
-                )
+                arousal_input = torch.cat([weighted_speech_a, weighted_prosody_a], dim=-1)
 
             # Separate regression heads
             valence_pred = self.valence_head(valence_input).squeeze(-1)  # [B]

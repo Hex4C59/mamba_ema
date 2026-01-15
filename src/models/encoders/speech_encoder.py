@@ -2,29 +2,14 @@
 
 from pathlib import Path
 from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoModel, AutoFeatureExtractor
+from transformers import AutoFeatureExtractor, AutoModel
 
 
 class SpeechEncoder(nn.Module):
-    """Speech encoder with pooling layer and feature caching.
-
-    Uses pre-trained WavLM or Wav2Vec2 to extract utterance-level features.
-    Supports multi-layer feature extraction with learnable weighted fusion.
-
-    Args:
-        model_name: HuggingFace model name
-        pooling: Pooling method ("mean" or "attention")
-        freeze: If True, freeze encoder weights
-        d_output: Output dimension (default: 768)
-        cache_dir: Directory to cache extracted features (default: /tmp/wavlm_cache)
-        use_cache: If True, use cached features when available
-        extract_layers: List of layer indices to extract (e.g., [6, 12, 18, 24])
-                       If None, use only final layer
-    """
-
     def __init__(
         self,
         model_name: str = "microsoft/wavlm-base-plus",
@@ -34,7 +19,7 @@ class SpeechEncoder(nn.Module):
         cache_dir: str = "/tmp/wavlm_cache",
         use_cache: bool = True,
         extract_layers: List[int] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.model_name = model_name
         self.pooling = pooling
@@ -43,15 +28,17 @@ class SpeechEncoder(nn.Module):
         self.cache_dir = Path(cache_dir)
         self.extract_layers = extract_layers
 
-        # Create cache directory if using cache
+        # 创建缓存目录
         if use_cache:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load pre-trained model
         self.model = AutoModel.from_pretrained(model_name)
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
 
-        # Enable hidden states output if using multi-layer extraction
+        # Enable gradient checkpointing to save memory (trade compute for memory)
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+
         if extract_layers is not None:
             self.model.config.output_hidden_states = True
             self.num_layers = len(extract_layers)
@@ -60,7 +47,6 @@ class SpeechEncoder(nn.Module):
         else:
             self.num_layers = 1
 
-        # Freeze/unfreeze
         if freeze:
             self.freeze()
 
@@ -69,12 +55,10 @@ class SpeechEncoder(nn.Module):
             self.attention = nn.Linear(d_output, 1)
 
     def freeze(self) -> None:
-        """Freeze encoder parameters."""
         for param in self.model.parameters():
             param.requires_grad = False
 
     def unfreeze(self) -> None:
-        """Unfreeze encoder parameters."""
         for param in self.model.parameters():
             param.requires_grad = True
 
@@ -84,27 +68,14 @@ class SpeechEncoder(nn.Module):
         names: List[str] | None = None,
         return_sequence: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        """Extract utterance-level or sequence-level features with caching.
-
-        Args:
-            waveforms: List of [T_i] tensors (variable length)
-            names: List of sample names for cache lookup (optional)
-            return_sequence: If True, return [B, T, d_output] with padding mask
-                           If False, return pooled [B, d_output]
-
-        Returns:
-            If return_sequence=False: Tensor [B, d_output]
-            If return_sequence=True: (Tensor [B, T_max, d_output], Tensor [B, T_max])
-                where mask[b, t]=True means padding position
-        """
-        batch_size = len(waveforms)
+        # 这行代码获取模型参数所在的设备
         device = next(self.model.parameters()).device
 
+        # 返回序列特征 (32, 100, 768)
         if return_sequence:
-            # Return sequence features with padding
             return self._forward_sequence(waveforms, device)
+        # 返回池化特征 (32, 768)
         else:
-            # Return pooled features (original behavior)
             return self._forward_pooled(waveforms, names, device)
 
     def _forward_pooled(
@@ -113,59 +84,47 @@ class SpeechEncoder(nn.Module):
         names: List[str] | None,
         device: torch.device,
     ) -> torch.Tensor:
-        """Extract pooled features (original behavior)."""
         features = []
+
         for i, wf in enumerate(waveforms):
-            # Try to load from cache if enabled and name provided
             cache_path = None
+            # 如果有缓存特征，优先使用缓存
             if self.use_cache and names is not None:
                 cache_path = self.cache_dir / f"{names[i]}.pt"
-
                 if cache_path.exists():
-                    # Load cached feature
                     try:
-                        cached_feat = torch.load(
-                            cache_path, map_location=device, weights_only=True
-                        )
+                        cached_feat = torch.load(cache_path, map_location=device, weights_only=True)
                         features.append(cached_feat)
-                        continue  # Skip extraction for this sample
+                        continue
                     except Exception as e:
-                        # If loading fails, extract and overwrite cache
                         print(f"Warning: Failed to load cache {cache_path}: {e}")
 
-            # Extract features if not cached
+            # 提取特征
             wf = wf.to(device)
             with torch.set_grad_enabled(self.training and not self._is_frozen()):
+                # 在waveforms前添加batch维度
                 outputs = self.model(wf.unsqueeze(0))
 
-                # Multi-layer feature extraction with weighted fusion
                 if self.extract_layers is not None:
-                    hidden_states = outputs.hidden_states  # Tuple of [1, T, d_output]
-                    # Extract specified layers
+                    hidden_states = outputs.hidden_states  # 获取特征维度
+                    # 提取指定层的特征
                     layer_features = [hidden_states[layer_idx] for layer_idx in self.extract_layers]
-                    # Weighted fusion: sum(weight_i * layer_i)
-                    weights = torch.softmax(self.layer_weights, dim=0)  # Normalize weights
-                    hidden = sum(w * layer for w, layer in zip(weights, layer_features))  # [1, T, d_output]
+                    # 加权融合: sum(weight_i * layer_i)
+                    weights = torch.softmax(self.layer_weights, dim=0)  # 归一化权重
+                    hidden = sum(
+                        w * layer for w, layer in zip(weights, layer_features)
+                    )  # [1, T, d_output]
                 else:
                     hidden = outputs.last_hidden_state  # [1, T, d_output]
 
-            # Pooling
             if self.pooling == "mean":
                 pooled = hidden.mean(dim=1).squeeze(0)  # [d_output]
             elif self.pooling == "attention":
-                # Attention pooling
-                attn_weights = torch.softmax(
-                    self.attention(hidden).squeeze(-1), dim=1
-                )  # [1, T]
-                pooled = (attn_weights.unsqueeze(-1) * hidden).sum(dim=1).squeeze(
-                    0
-                )  # [d_output]
-            else:
-                raise ValueError(f"Unknown pooling: {self.pooling}")
+                attn_weights = torch.softmax(self.attention(hidden).squeeze(-1), dim=1)  # [1, T]
+                pooled = (attn_weights.unsqueeze(-1) * hidden).sum(dim=1).squeeze(0)  # [d_output]
 
             features.append(pooled)
 
-            # Save to cache if enabled
             if self.use_cache and cache_path is not None:
                 try:
                     torch.save(pooled.cpu(), cache_path)
@@ -178,50 +137,71 @@ class SpeechEncoder(nn.Module):
     def _forward_sequence(
         self, waveforms: List[torch.Tensor], device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract sequence features with padding.
+        """Extract sequence features with batch processing and padding.
+
+        Args:
+            waveforms: List of audio tensors with different lengths
+            device: Target device
 
         Returns:
-            features: [B, T_max, d_output] - Padded sequence features
-            padding_mask: [B, T_max] - True for padding positions
+            padded_sequences: [B, T_max, d_output] - Padded sequences
+            attention_mask: [B, T_max] - Attention mask (True for padding)
         """
-        sequences = []
-        lengths = []
+        # Move waveforms to device and get lengths
+        waveforms = [wf.to(device) for wf in waveforms]
+        lengths = [wf.shape[0] for wf in waveforms]
+        max_len = max(lengths)
 
+        # Pad waveforms to same length
+        padded_waveforms = []
         for wf in waveforms:
-            wf = wf.to(device)
-            with torch.set_grad_enabled(self.training and not self._is_frozen()):
-                outputs = self.model(wf.unsqueeze(0))
+            if wf.shape[0] < max_len:
+                padding = torch.zeros(max_len - wf.shape[0], device=device)
+                wf = torch.cat([wf, padding])
+            padded_waveforms.append(wf)
 
-                # Multi-layer feature extraction
-                if self.extract_layers is not None:
-                    hidden_states = outputs.hidden_states
-                    layer_features = [
-                        hidden_states[layer_idx] for layer_idx in self.extract_layers
-                    ]
-                    weights = torch.softmax(self.layer_weights, dim=0)
-                    hidden = sum(w * layer for w, layer in zip(weights, layer_features))
-                else:
-                    hidden = outputs.last_hidden_state  # [1, T, d_output]
+        # Stack to batch: [B, T_max]
+        batch_waveforms = torch.stack(padded_waveforms)
 
-            # Remove batch dimension
-            hidden = hidden.squeeze(0)  # [T, d_output]
-            sequences.append(hidden)
-            lengths.append(hidden.size(0))
-
-        # Pad sequences to max length
-        padded_sequences = pad_sequence(
-            sequences, batch_first=True, padding_value=0.0
-        )  # [B, T_max, d_output]
-
-        # Create padding mask (True for padding positions)
-        max_len = padded_sequences.size(1)
-        padding_mask = torch.zeros(
-            len(sequences), max_len, dtype=torch.bool, device=device
-        )
+        # Create attention mask for WavLM (0 for valid, 1 for padding)
+        attention_mask = torch.zeros(len(waveforms), max_len, device=device)
         for i, length in enumerate(lengths):
-            padding_mask[i, length:] = True
+            if length < max_len:
+                attention_mask[i, length:] = 1
 
-        return padded_sequences, padding_mask
+        # Forward through model with batch processing
+        with torch.set_grad_enabled(self.training and not self._is_frozen()):
+            outputs = self.model(batch_waveforms, attention_mask=attention_mask)
+
+            if self.extract_layers is not None:
+                hidden_states = outputs.hidden_states
+                layer_features = [hidden_states[layer_idx] for layer_idx in self.extract_layers]
+                weights = torch.softmax(self.layer_weights, dim=0)
+                hidden = sum(w * layer for w, layer in zip(weights, layer_features))
+            else:
+                hidden = outputs.last_hidden_state  # [B, T_feature, d_output]
+
+        # Create padding mask for output (True for padding positions)
+        # WavLM downsamples by ~320x, so we need to calculate feature lengths
+        feature_lengths = [self._get_feat_extract_output_lengths(l) for l in lengths]
+        max_feat_len = hidden.shape[1]
+
+        padding_mask = torch.zeros(len(waveforms), max_feat_len, dtype=torch.bool, device=device)
+        for i, feat_len in enumerate(feature_lengths):
+            if feat_len < max_feat_len:
+                padding_mask[i, feat_len:] = True
+
+        return hidden, padding_mask
+
+    def _get_feat_extract_output_lengths(self, input_length: int) -> int:
+        """Calculate output length after WavLM's feature extraction.
+
+        WavLM uses conv layers with stride, typically downsamples by ~320x for 16kHz audio.
+        """
+        # This is an approximation - exact calculation depends on model architecture
+        # For WavLM: 7 conv layers with stride 2,2,2,2,2,2,2
+        # Total stride = 2^7 = 128 for base, but with padding it's ~320
+        return input_length // 320
 
     def _is_frozen(self) -> bool:
         """Check if model is frozen."""

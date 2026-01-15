@@ -5,17 +5,19 @@ import csv
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import numpy as np
+
 sys.path.insert(0, str(Path(__file__).parent))
 
+from data.ccsemo_dataset import CCSEMODataset
 from data.collate import collate_fn_baseline
 from data.iemocap_dataset import IEMOCAPDataset
-from data.ccsemo_dataset import CCSEMODataset
 from losses.ccc_loss import CCCLoss
 from metrics.ccc_metric import CCCMetric
 from models.mamba_ema_model import MambaEMAModel
@@ -28,9 +30,7 @@ from utils.seed import set_seed
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Mamba+EMA model")
     parser.add_argument("--config", type=str, required=True, help="Config file")
-    parser.add_argument(
-        "--mode", type=str, default="train", choices=["train", "val", "test"]
-    )
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "val", "test"])
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint")
     parser.add_argument("--fold", type=int, default=None, help="Fold number (1-5)")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use")
@@ -42,7 +42,6 @@ def parse_args():
 def build_dataloader(config: dict, split: str) -> DataLoader:
     dataset_name = config["data"]["name"]
 
-    # Select dataset class based on config
     if dataset_name == "IEMOCAP":
         dataset = IEMOCAPDataset(
             label_file=config["data"]["params"]["label_file"],
@@ -85,6 +84,7 @@ def train_one_epoch(
     accumulation_steps: int = 1,
     valence_weight: float = 1.0,
     arousal_weight: float = 1.0,
+    scaler: GradScaler = None,
 ) -> dict:
     model.train()
     total_loss = 0.0
@@ -94,32 +94,38 @@ def train_one_epoch(
         batch["valence"] = batch["valence"].to(device)
         batch["arousal"] = batch["arousal"].to(device)
 
-        output = model(batch)
+        # Mixed precision training
+        with autocast(enabled=(scaler is not None)):
+            output = model(batch)
 
-        # CCC loss for both valence and arousal with configurable weights
-        loss_v = loss_fn(output["valence_pred"], batch["valence"])
-        loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
-        loss = (
-            valence_weight * loss_v + arousal_weight * loss_a
-        ) / accumulation_steps  # 加权梯度
+            loss_v = loss_fn(output["valence_pred"], batch["valence"])
+            loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
+            loss = (valence_weight * loss_v + arousal_weight * loss_a) / accumulation_steps
 
-        loss.backward()
+        # Backward pass with gradient scaling
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # 梯度累积：每 accumulation_steps 步更新一次
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
             optimizer.zero_grad()
 
-        total_loss += loss.item() * accumulation_steps  # 恢复真实 loss
+        total_loss += loss.item() * accumulation_steps
 
     return {"loss": total_loss / len(loader)}
 
 
-def validate(
-    model: nn.Module, loader: DataLoader, loss_fn, metric, device: str
-) -> dict:
-    """Validate model."""
+def validate(model: nn.Module, loader: DataLoader, loss_fn, metric, device: str) -> dict:
     model.eval()
     metric.reset()
     total_loss = 0.0
@@ -131,21 +137,15 @@ def validate(
 
             output = model(batch)
 
-            # CCC loss for both valence and arousal
             loss_v = loss_fn(output["valence_pred"], batch["valence"])
             loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
             loss = loss_v + loss_a
             total_loss += loss.item()
 
-            # Update metric
             pred = (
-                torch.stack([output["valence_pred"], output["arousal_pred"]], dim=-1)
-                .cpu()
-                .numpy()
+                torch.stack([output["valence_pred"], output["arousal_pred"]], dim=-1).cpu().numpy()
             )
-            target = (
-                torch.stack([batch["valence"], batch["arousal"]], dim=-1).cpu().numpy()
-            )
+            target = torch.stack([batch["valence"], batch["arousal"]], dim=-1).cpu().numpy()
             metric.update(pred, target)
 
     metrics = metric.compute()
@@ -160,7 +160,6 @@ def main() -> None:
     config = load_yaml(args.config)
     config = apply_overrides(config, args.overrides)
 
-    # Apply command-line fold and gpu arguments (higher priority than config)
     if args.fold is not None:
         config["data"]["params"]["fold"] = args.fold
     if args.gpu is not None:
@@ -175,10 +174,10 @@ def main() -> None:
     logger.log_text(f"Using device: {device}")
     logger.log_text(f"Using Fold: {config['data']['params']['fold']}")
 
+    # 模型
     model = MambaEMAModel(**config["model"]["params"])
     model = model.to(device)
 
-    # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log_text(f"Total params: {total_params / 1e6:.2f}M")
@@ -190,11 +189,10 @@ def main() -> None:
     val_loader = build_dataloader(config, split="val")
     test_loader = build_dataloader(config, split="test")
 
-    # Use CCC loss for training
     loss_fn = CCCLoss()
     metric = CCCMetric()
 
-    # 差异学习率优化器
+    # 解冻预训练模型编码器，并实现差异学习率优化器
     freeze_speech_encoder = config["model"]["params"].get("freeze_speech_encoder", True)
 
     if not freeze_speech_encoder:
@@ -202,7 +200,7 @@ def main() -> None:
         encoder_lr = config["train"]["optimizer"].get("encoder_lr", 1e-5)
         base_lr = config["train"]["optimizer"]["lr"]
 
-        logger.log_text(f"Using differential learning rates:")
+        logger.log_text("Using differential learning rates:")
         logger.log_text(f"  Speech encoder: {encoder_lr}")
         logger.log_text(f"  Other params: {base_lr}")
 
@@ -249,17 +247,21 @@ def main() -> None:
         optimizer, T_max=config["train"]["epochs"]
     )
 
+    # Initialize gradient scaler for mixed precision training
+    use_amp = config["train"].get("use_amp", True)
+    scaler = GradScaler() if use_amp and device == "cuda" else None
+    if scaler is not None:
+        logger.log_text("Using mixed precision training (FP16)")
+
     best_metric = -float("inf")
     patience = config["train"]["early_stopping"]["patience"]
     min_delta = config["train"]["early_stopping"]["min_delta"]
     patience_counter = 0
 
-    # 梯度累积步数
     accumulation_steps = config["train"].get("accumulation_steps", 1)
     if accumulation_steps > 1:
         logger.log_text(f"Using gradient accumulation: {accumulation_steps} steps")
 
-    # 损失权重 (从 loss.params 读取，默认等权重)
     loss_params = config.get("loss", {}).get("params", {})
     valence_weight = loss_params.get("valence_weight", 1.0)
     arousal_weight = loss_params.get("arousal_weight", 1.0)
@@ -269,7 +271,6 @@ def main() -> None:
     for epoch in range(config["train"]["epochs"]):
         logger.log_text(f"\nEpoch {epoch + 1}/{config['train']['epochs']}")
 
-        # Train
         train_metrics = train_one_epoch(
             model,
             train_loader,
@@ -281,11 +282,11 @@ def main() -> None:
             accumulation_steps,
             valence_weight,
             arousal_weight,
+            scaler,
         )
         logger.log(train_metrics, epoch, "train")
         logger.log_text(f"Train Loss: {train_metrics['loss']:.4f}")
 
-        # Validate
         val_metrics = validate(model, val_loader, loss_fn, metric, device)
         logger.log(val_metrics, epoch, "val")
         logger.log_text(
@@ -294,7 +295,6 @@ def main() -> None:
             f"CCC-Avg: {val_metrics['ccc_avg']:.3f}"
         )
 
-        # Save checkpoint (only if improvement > min_delta)
         improvement = val_metrics["ccc_avg"] - best_metric
         if improvement > min_delta:
             best_metric = val_metrics["ccc_avg"]
@@ -314,7 +314,6 @@ def main() -> None:
                 f"Saved best model (CCC-Avg: {best_metric:.3f}, improvement: +{improvement:.4f})"
             )
         elif improvement > 0:
-            # Small improvement but not enough to save
             logger.log_text(
                 f"Small improvement (+{improvement:.4f}, threshold: {min_delta}). Not saving."
             )
@@ -325,30 +324,25 @@ def main() -> None:
 
         logger.plot_curves()
 
-        # Early stopping check
         if patience_counter >= patience:
             logger.log_text(f"\nEarly stopping triggered after {epoch + 1} epochs")
             break
 
         scheduler.step()
 
-    # Plot curves
     logger.plot_curves()
     logger.log_text(f"\nTraining complete! Best CCC-Avg: {best_metric:.3f}")
 
-    # Evaluate on test set
     logger.log_text("\n" + "=" * 50)
     logger.log_text("Evaluating on Test Set...")
     logger.log_text("=" * 50)
 
-    # Load best model
     checkpoint = torch.load(
         logger.exp_dir / "best_model.pth", map_location=device, weights_only=False
     )
     model.load_state_dict(checkpoint["model_state_dict"])
-    best_epoch = checkpoint["epoch"]  # Extract best epoch
+    best_epoch = checkpoint["epoch"]
 
-    # Test evaluation
     model.eval()
     all_preds = []
     all_labels = []
@@ -373,7 +367,6 @@ def main() -> None:
     all_preds = torch.cat(all_preds, dim=0)  # [N, 2]
     all_labels = torch.cat(all_labels, dim=0)  # [N, 2]
 
-    # Compute test metrics (CCC)
     metric.reset()
     metric.update(all_preds.cpu().numpy(), all_labels.cpu().numpy())
     test_metrics = metric.compute()
@@ -381,8 +374,6 @@ def main() -> None:
     test_ccc_v = test_metrics["ccc_v"]
     test_ccc_a = test_metrics["ccc_a"]
     test_ccc_avg = test_metrics["ccc_avg"]
-
-
 
     preds_np = all_preds.cpu().numpy()
     labels_np = all_labels.cpu().numpy()
@@ -396,7 +387,6 @@ def main() -> None:
         f"  MSE-V: {mse_v:.4f}, MSE-A: {mse_a:.4f}, MSE-Avg: {mse_avg:.4f}"
     )
 
-    # Save best results
     with open(logger.exp_dir / "best_result.txt", "w") as f:
         f.write(f"best_epoch: {best_epoch}\n")
         f.write(f"ccc_v: {test_ccc_v:.4f}\n")
@@ -408,9 +398,7 @@ def main() -> None:
 
     with open(logger.exp_dir / "test_prediction.csv", "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            ["name", "valence_true", "arousal_true", "valence_pred", "arousal_pred"]
-        )
+        writer.writerow(["name", "valence_true", "arousal_true", "valence_pred", "arousal_pred"])
         for i, name in enumerate(all_names):
             writer.writerow(
                 [
