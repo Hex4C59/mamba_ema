@@ -1,6 +1,7 @@
 """Speaker encoder using pre-trained ECAPA-TDNN."""
 
 from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,12 +9,7 @@ import torch.nn.functional as F
 
 class SpeakerEncoder(nn.Module):
     """Speaker encoder using pre-trained ECAPA-TDNN.
-
-    Args:
-        model_name: SpeechBrain model name (default: ECAPA-TDNN)
-        d_output: Output dimension (default: 192)
-        normalize: If True, L2 normalize embeddings
-    """
+   """
 
     def __init__(
         self,
@@ -26,9 +22,6 @@ class SpeakerEncoder(nn.Module):
         self.d_output = d_output
         self.normalize = normalize
 
-        # For this baseline, use a simple CNN-based encoder
-        # In practice, you would load speechbrain's ECAPA-TDNN here
-        # For now, use a placeholder CNN
         self.encoder = nn.Sequential(
             nn.Conv1d(1, 64, kernel_size=5, stride=2, padding=2),
             nn.ReLU(),
@@ -40,12 +33,6 @@ class SpeakerEncoder(nn.Module):
 
     def forward(self, waveforms: List[torch.Tensor]) -> torch.Tensor:
         """Extract speaker embeddings.
-
-        Args:
-            waveforms: List of [T_i] tensors
-
-        Returns:
-            Tensor [B, d_output], L2 normalized if normalize=True
         """
         device = next(self.encoder.parameters()).device
         waveforms = [wf.to(device) for wf in waveforms]
