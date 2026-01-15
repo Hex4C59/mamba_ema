@@ -75,29 +75,40 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
 
 
 def train_one_epoch(
-    model: nn.Module, loader: DataLoader, optimizer, loss_fn, device: str, logger, grad_clip: float
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer,
+    loss_fn,
+    device: str,
+    logger,
+    grad_clip: float,
+    accumulation_steps: int = 1
 ) -> dict:
-    """Train for one epoch."""
+    """Train for one epoch with gradient accumulation support."""
     model.train()
     total_loss = 0.0
+    optimizer.zero_grad()
 
-    for batch in tqdm(loader, desc="Training"):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Training")):
         batch["valence"] = batch["valence"].to(device)
         batch["arousal"] = batch["arousal"].to(device)
 
-        optimizer.zero_grad()
         output = model(batch)
 
         # CCC loss for both valence and arousal
         loss_v = loss_fn(output["valence_pred"], batch["valence"])
         loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
-        loss = loss_v + loss_a
+        loss = (loss_v + loss_a) / accumulation_steps  # 平均梯度
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
 
-        total_loss += loss.item()
+        # 梯度累积：每 accumulation_steps 步更新一次
+        if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * accumulation_steps  # 恢复真实 loss
 
     return {"loss": total_loss / len(loader)}
 
@@ -159,6 +170,12 @@ def main() -> None:
     model = MambaEMAModel(**config["model"]["params"])
     model = model.to(device)
 
+    # 统计参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.log_text(f"Total params: {total_params / 1e6:.2f}M")
+    logger.log_text(f"Trainable params: {trainable_params / 1e6:.2f}M ({trainable_params/total_params*100:.1f}%)")
+
     train_loader = build_dataloader(config, split="train")
     val_loader = build_dataloader(config, split="val")
     test_loader = build_dataloader(config, split="test")
@@ -167,11 +184,53 @@ def main() -> None:
     loss_fn = CCCLoss()
     metric = CCCMetric()
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config["train"]["optimizer"]["lr"],
-        weight_decay=config["train"]["optimizer"]["weight_decay"],
-    )
+    # 差异学习率优化器
+    freeze_speech_encoder = config["model"]["params"].get("freeze_speech_encoder", True)
+
+    if not freeze_speech_encoder:
+        # 解冻时使用差异学习率
+        encoder_lr = config["train"]["optimizer"].get("encoder_lr", 1e-5)
+        base_lr = config["train"]["optimizer"]["lr"]
+
+        logger.log_text(f"Using differential learning rates:")
+        logger.log_text(f"  Speech encoder: {encoder_lr}")
+        logger.log_text(f"  Other params: {base_lr}")
+
+        param_groups = [
+            # Speech encoder (WavLM) 使用小学习率
+            {
+                "params": model.speech_encoder.model.parameters(),
+                "lr": encoder_lr,
+                "name": "speech_encoder"
+            },
+            # Layer weights 使用正常学习率
+            {
+                "params": [model.speech_encoder.layer_weights] if hasattr(model.speech_encoder, 'layer_weights') else [],
+                "lr": base_lr,
+                "name": "layer_weights"
+            },
+            # 其他所有参数使用正常学习率
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if "speech_encoder" not in n and p.requires_grad
+                ],
+                "lr": base_lr,
+                "name": "other_params"
+            },
+        ]
+
+        optimizer = AdamW(
+            param_groups,
+            weight_decay=config["train"]["optimizer"]["weight_decay"],
+        )
+    else:
+        # 冻结时使用统一学习率
+        optimizer = AdamW(
+            model.parameters(),
+            lr=config["train"]["optimizer"]["lr"],
+            weight_decay=config["train"]["optimizer"]["weight_decay"],
+        )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config["train"]["epochs"]
@@ -182,12 +241,18 @@ def main() -> None:
     min_delta = config["train"]["early_stopping"]["min_delta"]
     patience_counter = 0
 
+    # 梯度累积步数
+    accumulation_steps = config["train"].get("accumulation_steps", 1)
+    if accumulation_steps > 1:
+        logger.log_text(f"Using gradient accumulation: {accumulation_steps} steps")
+
     for epoch in range(config["train"]["epochs"]):
         logger.log_text(f"\nEpoch {epoch + 1}/{config['train']['epochs']}")
 
         # Train
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, logger, config["train"]["grad_clip"]
+            model, train_loader, optimizer, loss_fn, device, logger,
+            config["train"]["grad_clip"], accumulation_steps
         )
         logger.log(train_metrics, epoch, "train")
         logger.log_text(f"Train Loss: {train_metrics['loss']:.4f}")

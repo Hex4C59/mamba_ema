@@ -19,6 +19,7 @@ class MambaEMAModel(nn.Module):
         speech_encoder_name: str = "pretrained_model/wav2vec2-base",
         d_speech: int = 768,
         speech_encoder_layers: list = None,  # Multi-layer extraction
+        speech_encoder_pooling: str = "mean",  # Pooling method: "mean" or "attention"
         prosody_feature_dir: str = "data/features/IEMOCAP/egemaps",
         d_prosody_in: int = 88,
         d_prosody_out: int = 64,
@@ -31,6 +32,7 @@ class MambaEMAModel(nn.Module):
         ema_alpha: float = 0.8,
         mamba_d_model: int = 256,
         mamba_n_layers: int = 2,
+        freeze_speech_encoder: bool = True,  # 控制是否冻结 speech encoder
     ) -> None:
         super().__init__()
         self.use_ema = use_ema
@@ -38,8 +40,8 @@ class MambaEMAModel(nn.Module):
 
         self.speech_encoder = SpeechEncoder(
             model_name=speech_encoder_name,
-            pooling="mean",
-            freeze=True,
+            pooling=speech_encoder_pooling,
+            freeze=freeze_speech_encoder,
             d_output=d_speech,
             extract_layers=speech_encoder_layers,
         )
@@ -91,7 +93,8 @@ class MambaEMAModel(nn.Module):
             nn.LayerNorm(d_hidden // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_hidden // 2, 1),  # Output valence
+            nn.Linear(d_hidden // 2, 1),
+            nn.Sigmoid(),  # Output [0, 1]
         )
 
         # Arousal head: speech-weighted fusion
@@ -112,7 +115,8 @@ class MambaEMAModel(nn.Module):
             nn.LayerNorm(d_hidden // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_hidden // 2, 1),  # Output arousal
+            nn.Linear(d_hidden // 2, 1),
+            nn.Sigmoid(),  # Output [0, 1]
         )
 
         # Save dimensions for feature split
