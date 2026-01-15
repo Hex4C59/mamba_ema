@@ -11,6 +11,7 @@ from .encoders.speech_encoder import SpeechEncoder
 from .modules.ema import EMAState
 from .modules.film import FiLM
 from .modules.mamba_updater import MambaUpdater
+from .modules.cross_attention import CrossAttention
 
 
 class MambaEMAModel(nn.Module):
@@ -33,10 +34,13 @@ class MambaEMAModel(nn.Module):
         mamba_d_model: int = 256,
         mamba_n_layers: int = 2,
         freeze_speech_encoder: bool = True,  # 控制是否冻结 speech encoder
+        use_cross_attention: bool = False,  # 是否使用交叉注意力
+        cross_attention_heads: int = 4,  # 交叉注意力头数
     ) -> None:
         super().__init__()
         self.use_ema = use_ema
         self.d_state = d_state
+        self.use_cross_attention = use_cross_attention
 
         self.speech_encoder = SpeechEncoder(
             model_name=speech_encoder_name,
@@ -61,7 +65,21 @@ class MambaEMAModel(nn.Module):
         # FiLM modulation
         self.film = FiLM(speaker_dim=d_speaker, feat_dim=d_speech, hidden_dim=256)
 
-        d_fused = d_speech + d_prosody_out  # e.g., 1024 + 64 = 1088 for WavLM-Large
+        # Cross-attention: Prosody attends to Speech sequence
+        if use_cross_attention:
+            self.cross_attention = CrossAttention(
+                d_query=d_prosody_out,
+                d_kv=d_speech,
+                d_hidden=d_hidden,
+                num_heads=cross_attention_heads,
+                dropout=dropout,
+            )
+            # After cross-attention, we have d_hidden dimensional features
+            d_fused = d_hidden
+        else:
+            self.cross_attention = None
+            d_fused = d_speech + d_prosody_out  # e.g., 1024 + 64 = 1088
+
         if use_ema:
             self.mamba_updater = MambaUpdater(
                 d_input=d_fused,
@@ -129,66 +147,103 @@ class MambaEMAModel(nn.Module):
         waveforms = batch["waveforms"]
         names = batch["names"]
 
-        h = self.speech_encoder(waveforms, names)  # [B, 1024]
+        # Prosody features (always pooled)
         p = self.prosody_encoder(names)  # [B, 64]
         s = self.speaker_encoder(waveforms)  # [B, 192]
 
-        h_mod = self.film(h, s)  # [B, 1024]
-        z = torch.cat([h_mod, p], dim=-1)  # [B, 1088]
+        # Branch based on cross-attention usage
+        if self.use_cross_attention:
+            # Get sequence features from speech encoder
+            h_seq, padding_mask = self.speech_encoder(
+                waveforms, names, return_sequence=True
+            )  # h_seq: [B, T, 1024], padding_mask: [B, T]
+
+            # Apply FiLM modulation to sequence
+            # Expand speaker embedding to sequence
+            s_expanded = s.unsqueeze(1).expand(-1, h_seq.size(1), -1)  # [B, T, 192]
+            h_seq_mod = torch.zeros_like(h_seq)
+            for t in range(h_seq.size(1)):
+                h_seq_mod[:, t, :] = self.film(h_seq[:, t, :], s_expanded[:, t, :])
+
+            # Cross-attention: Prosody queries Speech sequence
+            z = self.cross_attention(
+                query=p, key_value=h_seq_mod, key_padding_mask=padding_mask
+            )  # [B, d_hidden]
+        else:
+            # Original pooled features
+            h = self.speech_encoder(waveforms, names)  # [B, 1024]
+            h_mod = self.film(h, s)  # [B, 1024]
+            z = torch.cat([h_mod, p], dim=-1)  # [B, 1088]
 
         # Update EMA state if enabled
         if self.use_ema:
             u_t = self.mamba_updater(z)  # [B, d_state]
             c_t = self.ema(u_t, state)  # [B, d_state]
 
-            head_input = torch.cat([z, c_t], dim=-1)  # [B, 1088+d_state]
+            head_input = torch.cat([z, c_t], dim=-1)  # [B, d_fused+d_state]
         else:
             head_input = z
             c_t = None
 
-        # Split features for separate weighting
-        # head_input = [h_mod (speech), p (prosody), c_t (ema_state)]
-        speech_feat = head_input[:, :self.d_speech]  # [B, 1024]
-        prosody_feat = head_input[:, self.d_speech:self.d_speech + self.d_prosody_out]  # [B, 64]
-        if self.use_ema:
-            ema_feat = head_input[:, self.d_speech + self.d_prosody_out:]  # [B, d_state]
-
-        # Valence: emphasize prosody features
-        # Compute attention weights over prosody vs. other features
-        valence_weights = self.valence_attention(head_input)  # [B, 2]
-        w_prosody_v = valence_weights[:, 0:1]  # [B, 1]
-        w_other_v = valence_weights[:, 1:2]  # [B, 1]
-
-        # Weighted features
-        weighted_prosody_v = prosody_feat * w_prosody_v  # [B, 64]
-        weighted_speech_v = speech_feat * w_other_v  # [B, 1024]
-
-        if self.use_ema:
-            weighted_ema_v = ema_feat * w_other_v  # [B, d_state]
-            valence_input = torch.cat([weighted_speech_v, weighted_prosody_v, weighted_ema_v], dim=-1)
+        # For cross-attention mode, we don't split features (already fused)
+        if self.use_cross_attention:
+            # Direct prediction without feature-wise weighting
+            valence_pred = self.valence_head(head_input).squeeze(-1)  # [B]
+            arousal_pred = self.arousal_head(head_input).squeeze(-1)  # [B]
         else:
-            valence_input = torch.cat([weighted_speech_v, weighted_prosody_v], dim=-1)
+            # Original feature-wise weighting logic
+            # Split features for separate weighting
+            # head_input = [h_mod (speech), p (prosody), c_t (ema_state)]
+            speech_feat = head_input[:, :self.d_speech]  # [B, 1024]
+            prosody_feat = head_input[
+                :, self.d_speech:self.d_speech + self.d_prosody_out
+            ]  # [B, 64]
+            if self.use_ema:
+                ema_feat = head_input[
+                    :, self.d_speech + self.d_prosody_out:
+                ]  # [B, d_state]
 
-        # Arousal: emphasize speech features
-        arousal_weights = self.arousal_attention(head_input)  # [B, 2]
-        w_speech_a = arousal_weights[:, 0:1]  # [B, 1]
-        w_other_a = arousal_weights[:, 1:2]  # [B, 1]
+            # Valence: emphasize prosody features
+            valence_weights = self.valence_attention(head_input)  # [B, 2]
+            w_prosody_v = valence_weights[:, 0:1]  # [B, 1]
+            w_other_v = valence_weights[:, 1:2]  # [B, 1]
 
-        # Weighted features
-        weighted_speech_a = speech_feat * w_speech_a  # [B, 1024]
-        weighted_prosody_a = prosody_feat * w_other_a  # [B, 64]
+            weighted_prosody_v = prosody_feat * w_prosody_v  # [B, 64]
+            weighted_speech_v = speech_feat * w_other_v  # [B, 1024]
 
-        if self.use_ema:
-            weighted_ema_a = ema_feat * w_other_a  # [B, d_state]
-            arousal_input = torch.cat([weighted_speech_a, weighted_prosody_a, weighted_ema_a], dim=-1)
-        else:
-            arousal_input = torch.cat([weighted_speech_a, weighted_prosody_a], dim=-1)
+            if self.use_ema:
+                weighted_ema_v = ema_feat * w_other_v  # [B, d_state]
+                valence_input = torch.cat(
+                    [weighted_speech_v, weighted_prosody_v, weighted_ema_v], dim=-1
+                )
+            else:
+                valence_input = torch.cat(
+                    [weighted_speech_v, weighted_prosody_v], dim=-1
+                )
 
-        # Separate regression heads
-        valence = self.valence_head(valence_input).squeeze(-1)  # [B]
-        arousal = self.arousal_head(arousal_input).squeeze(-1)  # [B]
+            # Arousal: emphasize speech features
+            arousal_weights = self.arousal_attention(head_input)  # [B, 2]
+            w_speech_a = arousal_weights[:, 0:1]  # [B, 1]
+            w_other_a = arousal_weights[:, 1:2]  # [B, 1]
 
-        result = {"valence_pred": valence, "arousal_pred": arousal}
+            weighted_speech_a = speech_feat * w_speech_a  # [B, 1024]
+            weighted_prosody_a = prosody_feat * w_other_a  # [B, 64]
+
+            if self.use_ema:
+                weighted_ema_a = ema_feat * w_other_a  # [B, d_state]
+                arousal_input = torch.cat(
+                    [weighted_speech_a, weighted_prosody_a, weighted_ema_a], dim=-1
+                )
+            else:
+                arousal_input = torch.cat(
+                    [weighted_speech_a, weighted_prosody_a], dim=-1
+                )
+
+            # Separate regression heads
+            valence_pred = self.valence_head(valence_input).squeeze(-1)  # [B]
+            arousal_pred = self.arousal_head(arousal_input).squeeze(-1)  # [B]
+
+        result = {"valence_pred": valence_pred, "arousal_pred": arousal_pred}
         if self.use_ema:
             result["state"] = c_t
 

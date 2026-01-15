@@ -1,9 +1,10 @@
 """Speech encoder using pre-trained WavLM/Wav2Vec2 models with caching."""
 
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel, AutoFeatureExtractor
 
 
@@ -78,20 +79,41 @@ class SpeechEncoder(nn.Module):
             param.requires_grad = True
 
     def forward(
-        self, waveforms: List[torch.Tensor], names: List[str] | None = None
-    ) -> torch.Tensor:
-        """Extract utterance-level features with caching.
+        self,
+        waveforms: List[torch.Tensor],
+        names: List[str] | None = None,
+        return_sequence: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """Extract utterance-level or sequence-level features with caching.
 
         Args:
             waveforms: List of [T_i] tensors (variable length)
             names: List of sample names for cache lookup (optional)
+            return_sequence: If True, return [B, T, d_output] with padding mask
+                           If False, return pooled [B, d_output]
 
         Returns:
-            Tensor [B, d_output]
+            If return_sequence=False: Tensor [B, d_output]
+            If return_sequence=True: (Tensor [B, T_max, d_output], Tensor [B, T_max])
+                where mask[b, t]=True means padding position
         """
         batch_size = len(waveforms)
         device = next(self.model.parameters()).device
 
+        if return_sequence:
+            # Return sequence features with padding
+            return self._forward_sequence(waveforms, device)
+        else:
+            # Return pooled features (original behavior)
+            return self._forward_pooled(waveforms, names, device)
+
+    def _forward_pooled(
+        self,
+        waveforms: List[torch.Tensor],
+        names: List[str] | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Extract pooled features (original behavior)."""
         features = []
         for i, wf in enumerate(waveforms):
             # Try to load from cache if enabled and name provided
@@ -152,6 +174,54 @@ class SpeechEncoder(nn.Module):
 
         # Stack batch
         return torch.stack(features)  # [B, d_output]
+
+    def _forward_sequence(
+        self, waveforms: List[torch.Tensor], device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract sequence features with padding.
+
+        Returns:
+            features: [B, T_max, d_output] - Padded sequence features
+            padding_mask: [B, T_max] - True for padding positions
+        """
+        sequences = []
+        lengths = []
+
+        for wf in waveforms:
+            wf = wf.to(device)
+            with torch.set_grad_enabled(self.training and not self._is_frozen()):
+                outputs = self.model(wf.unsqueeze(0))
+
+                # Multi-layer feature extraction
+                if self.extract_layers is not None:
+                    hidden_states = outputs.hidden_states
+                    layer_features = [
+                        hidden_states[layer_idx] for layer_idx in self.extract_layers
+                    ]
+                    weights = torch.softmax(self.layer_weights, dim=0)
+                    hidden = sum(w * layer for w, layer in zip(weights, layer_features))
+                else:
+                    hidden = outputs.last_hidden_state  # [1, T, d_output]
+
+            # Remove batch dimension
+            hidden = hidden.squeeze(0)  # [T, d_output]
+            sequences.append(hidden)
+            lengths.append(hidden.size(0))
+
+        # Pad sequences to max length
+        padded_sequences = pad_sequence(
+            sequences, batch_first=True, padding_value=0.0
+        )  # [B, T_max, d_output]
+
+        # Create padding mask (True for padding positions)
+        max_len = padded_sequences.size(1)
+        padding_mask = torch.zeros(
+            len(sequences), max_len, dtype=torch.bool, device=device
+        )
+        for i, length in enumerate(lengths):
+            padding_mask[i, length:] = True
+
+        return padded_sequences, padding_mask
 
     def _is_frozen(self) -> bool:
         """Check if model is frozen."""

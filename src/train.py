@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 
 from data.collate import collate_fn_baseline
@@ -26,10 +26,11 @@ from utils.seed import set_seed
 
 
 def parse_args():
-    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Train Mamba+EMA model")
     parser.add_argument("--config", type=str, required=True, help="Config file")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "val", "test"])
+    parser.add_argument(
+        "--mode", type=str, default="train", choices=["train", "val", "test"]
+    )
     parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint")
     parser.add_argument("--fold", type=int, default=None, help="Fold number (1-5)")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use")
@@ -39,7 +40,6 @@ def parse_args():
 
 
 def build_dataloader(config: dict, split: str) -> DataLoader:
-    """Build dataloader from config."""
     dataset_name = config["data"]["name"]
 
     # Select dataset class based on config
@@ -82,9 +82,10 @@ def train_one_epoch(
     device: str,
     logger,
     grad_clip: float,
-    accumulation_steps: int = 1
+    accumulation_steps: int = 1,
+    valence_weight: float = 1.0,
+    arousal_weight: float = 1.0,
 ) -> dict:
-    """Train for one epoch with gradient accumulation support."""
     model.train()
     total_loss = 0.0
     optimizer.zero_grad()
@@ -95,10 +96,12 @@ def train_one_epoch(
 
         output = model(batch)
 
-        # CCC loss for both valence and arousal
+        # CCC loss for both valence and arousal with configurable weights
         loss_v = loss_fn(output["valence_pred"], batch["valence"])
         loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
-        loss = (loss_v + loss_a) / accumulation_steps  # 平均梯度
+        loss = (
+            valence_weight * loss_v + arousal_weight * loss_a
+        ) / accumulation_steps  # 加权梯度
 
         loss.backward()
 
@@ -113,7 +116,9 @@ def train_one_epoch(
     return {"loss": total_loss / len(loader)}
 
 
-def validate(model: nn.Module, loader: DataLoader, loss_fn, metric, device: str) -> dict:
+def validate(
+    model: nn.Module, loader: DataLoader, loss_fn, metric, device: str
+) -> dict:
     """Validate model."""
     model.eval()
     metric.reset()
@@ -134,9 +139,13 @@ def validate(model: nn.Module, loader: DataLoader, loss_fn, metric, device: str)
 
             # Update metric
             pred = (
-                torch.stack([output["valence_pred"], output["arousal_pred"]], dim=-1).cpu().numpy()
+                torch.stack([output["valence_pred"], output["arousal_pred"]], dim=-1)
+                .cpu()
+                .numpy()
             )
-            target = torch.stack([batch["valence"], batch["arousal"]], dim=-1).cpu().numpy()
+            target = (
+                torch.stack([batch["valence"], batch["arousal"]], dim=-1).cpu().numpy()
+            )
             metric.update(pred, target)
 
     metrics = metric.compute()
@@ -164,7 +173,6 @@ def main() -> None:
     gpu_id = config["train"]["gpu_id"]
     device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
     logger.log_text(f"Using device: {device}")
-    logger.log_text(f"Using GPU: {gpu_id}")
     logger.log_text(f"Using Fold: {config['data']['params']['fold']}")
 
     model = MambaEMAModel(**config["model"]["params"])
@@ -174,7 +182,9 @@ def main() -> None:
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log_text(f"Total params: {total_params / 1e6:.2f}M")
-    logger.log_text(f"Trainable params: {trainable_params / 1e6:.2f}M ({trainable_params/total_params*100:.1f}%)")
+    logger.log_text(
+        f"Trainable params: {trainable_params / 1e6:.2f}M ({trainable_params / total_params * 100:.1f}%)"
+    )
 
     train_loader = build_dataloader(config, split="train")
     val_loader = build_dataloader(config, split="val")
@@ -201,22 +211,25 @@ def main() -> None:
             {
                 "params": model.speech_encoder.model.parameters(),
                 "lr": encoder_lr,
-                "name": "speech_encoder"
+                "name": "speech_encoder",
             },
             # Layer weights 使用正常学习率
             {
-                "params": [model.speech_encoder.layer_weights] if hasattr(model.speech_encoder, 'layer_weights') else [],
+                "params": [model.speech_encoder.layer_weights]
+                if hasattr(model.speech_encoder, "layer_weights")
+                else [],
                 "lr": base_lr,
-                "name": "layer_weights"
+                "name": "layer_weights",
             },
             # 其他所有参数使用正常学习率
             {
                 "params": [
-                    p for n, p in model.named_parameters()
+                    p
+                    for n, p in model.named_parameters()
                     if "speech_encoder" not in n and p.requires_grad
                 ],
                 "lr": base_lr,
-                "name": "other_params"
+                "name": "other_params",
             },
         ]
 
@@ -246,13 +259,28 @@ def main() -> None:
     if accumulation_steps > 1:
         logger.log_text(f"Using gradient accumulation: {accumulation_steps} steps")
 
+    # 损失权重 (从 loss.params 读取，默认等权重)
+    loss_params = config.get("loss", {}).get("params", {})
+    valence_weight = loss_params.get("valence_weight", 1.0)
+    arousal_weight = loss_params.get("arousal_weight", 1.0)
+    if valence_weight != 1.0 or arousal_weight != 1.0:
+        logger.log_text(f"Using weighted loss: V={valence_weight}, A={arousal_weight}")
+
     for epoch in range(config["train"]["epochs"]):
         logger.log_text(f"\nEpoch {epoch + 1}/{config['train']['epochs']}")
 
         # Train
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, device, logger,
-            config["train"]["grad_clip"], accumulation_steps
+            model,
+            train_loader,
+            optimizer,
+            loss_fn,
+            device,
+            logger,
+            config["train"]["grad_clip"],
+            accumulation_steps,
+            valence_weight,
+            arousal_weight,
         )
         logger.log(train_metrics, epoch, "train")
         logger.log_text(f"Train Loss: {train_metrics['loss']:.4f}")
@@ -354,8 +382,7 @@ def main() -> None:
     test_ccc_a = test_metrics["ccc_a"]
     test_ccc_avg = test_metrics["ccc_avg"]
 
-    # Compute MSE
-    import numpy as np
+
 
     preds_np = all_preds.cpu().numpy()
     labels_np = all_labels.cpu().numpy()
@@ -381,7 +408,9 @@ def main() -> None:
 
     with open(logger.exp_dir / "test_prediction.csv", "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["name", "valence_true", "arousal_true", "valence_pred", "arousal_pred"])
+        writer.writerow(
+            ["name", "valence_true", "arousal_true", "valence_pred", "arousal_pred"]
+        )
         for i, name in enumerate(all_names):
             writer.writerow(
                 [
