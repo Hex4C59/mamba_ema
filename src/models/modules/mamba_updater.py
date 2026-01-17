@@ -72,33 +72,36 @@ class MambaUpdater(nn.Module):
         )
 
     def forward(self, z_t: torch.Tensor) -> torch.Tensor:
-        """Extract state increment from observation.
+        """Extract features from observation.
 
         Args:
-            z_t: Current observation [B, d_input]
+            z_t: Current observation [B, d_input] or [B, L, d_input]
 
         Returns:
-            u_t: State increment [B, d_output]
+            u_t: Output features [B, d_output] or [B, L, d_output]
         """
-        # Project input
-        x = self.input_proj(z_t)  # [B, d_model]
+        # Project input (works for both 2D and 3D)
+        x = self.input_proj(z_t)  # [B, d_model] or [B, L, d_model]
 
-        # Add sequence dimension for Mamba (expects [B, L, D])
-        x = x.unsqueeze(1)  # [B, 1, d_model]
+        # Handle 2D input (add sequence dimension for Mamba)
+        is_2d = x.dim() == 2
+        if is_2d:
+            x = x.unsqueeze(1)  # [B, d_model] → [B, 1, d_model]
 
         # Pass through Mamba layers with residual connections
         for mamba_layer, norm, dropout in zip(self.mamba_layers, self.norms, self.dropouts):
             # Pre-norm architecture
             residual = x
             x = norm(x)
-            x = mamba_layer(x)  # [B, 1, d_model]
+            x = mamba_layer(x)  # [B, L, d_model]
             x = dropout(x)
             x = x + residual  # Residual connection
 
-        # Remove sequence dimension
-        x = x.squeeze(1)  # [B, d_model]
+        # Remove sequence dimension if input was 2D
+        if is_2d:
+            x = x.squeeze(1)  # [B, 1, d_model] → [B, d_model]
 
         # Project to output dimension
-        u_t = self.output_proj(x)  # [B, d_output]
+        u_t = self.output_proj(x)  # [B, d_output] or [B, L, d_output]
 
         return u_t

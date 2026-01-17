@@ -1,5 +1,3 @@
-"""Training script for Mamba + EMA emotion recognition model."""
-
 import argparse
 import csv
 import sys
@@ -17,32 +15,43 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data.ccsemo_dataset import CCSEMODataset
 from data.collate import collate_fn_baseline
+from data.collate_features import collate_fn_features
+from data.feature_dataset import FeatureDataset
 from data.iemocap_dataset import IEMOCAPDataset
 from losses.ccc_loss import CCCLoss
 from metrics.ccc_metric import CCCMetric
-from models.mamba_ema_model import MambaEMAModel
+from models.mamba_ema_model import MultimodalEmotionModel
 from utils.checkpoint import save_checkpoint
 from utils.config import apply_overrides, load_yaml
 from utils.experiment import init_experiment
 from utils.seed import set_seed
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Mamba+EMA model")
     parser.add_argument("--config", type=str, required=True, help="Config file")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "val", "test"])
-    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint")
     parser.add_argument("--fold", type=int, default=None, help="Fold number (1-5)")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use")
     parser.add_argument("overrides", nargs="*", help="Config overrides (key=value)")
-
     return parser.parse_args()
 
 
 def build_dataloader(config: dict, split: str) -> DataLoader:
+    use_offline = config["data"].get("use_offline_features", False)
     dataset_name = config["data"]["name"]
 
-    if dataset_name == "IEMOCAP":
+    if use_offline:
+        # Offline mode: load pre-extracted features
+        dataset = FeatureDataset(
+            label_file=config["data"]["params"]["label_file"],
+            feature_root=config["data"]["params"]["feature_root"],
+            split=split,
+            fold=config["data"]["params"].get("fold", 1),
+            normalize_vad=config["data"]["params"].get("normalize_vad", True),
+            features=config["data"]["params"].get("features", ["wavlm", "ecapa", "egemaps"]),
+        )
+        collate_fn = collate_fn_features
+    elif dataset_name == "IEMOCAP":
         dataset = IEMOCAPDataset(
             label_file=config["data"]["params"]["label_file"],
             audio_root=config["data"]["params"]["audio_root"],
@@ -51,6 +60,7 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
             sample_rate=config["data"]["params"]["sample_rate"],
             normalize_vad=config["data"]["params"]["normalize_vad"],
         )
+        collate_fn = collate_fn_baseline
     elif dataset_name == "CCSEMO":
         dataset = CCSEMODataset(
             label_file=config["data"]["params"]["label_file"],
@@ -59,6 +69,7 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
             sample_rate=config["data"]["params"]["sample_rate"],
             normalize_vad=config["data"]["params"]["normalize_vad"],
         )
+        collate_fn = collate_fn_baseline
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -67,7 +78,7 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
         batch_size=config["data"]["loader"]["batch_size"],
         shuffle=config["data"]["loader"]["shuffle"] if split == "train" else False,
         num_workers=config["data"]["loader"]["num_workers"],
-        collate_fn=collate_fn_baseline,
+        collate_fn=collate_fn,
     )
 
     return loader
@@ -76,10 +87,9 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
-    optimizer,
-    loss_fn,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: nn.Module,
     device: str,
-    logger,
     grad_clip: float,
     accumulation_steps: int = 1,
     valence_weight: float = 1.0,
@@ -94,7 +104,6 @@ def train_one_epoch(
         batch["valence"] = batch["valence"].to(device)
         batch["arousal"] = batch["arousal"].to(device)
 
-        # Mixed precision training
         with autocast(enabled=(scaler is not None)):
             output = model(batch)
 
@@ -102,13 +111,11 @@ def train_one_epoch(
             loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
             loss = (valence_weight * loss_v + arousal_weight * loss_a) / accumulation_steps
 
-        # Backward pass with gradient scaling
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        # 梯度累积：每 accumulation_steps 步更新一次
         if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(loader):
             if scaler is not None:
                 scaler.unscale_(optimizer)
@@ -125,7 +132,7 @@ def train_one_epoch(
     return {"loss": total_loss / len(loader)}
 
 
-def validate(model: nn.Module, loader: DataLoader, loss_fn, metric, device: str) -> dict:
+def validate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, metric: nn.Module, device: str) -> dict:
     model.eval()
     metric.reset()
     total_loss = 0.0
@@ -175,7 +182,7 @@ def main() -> None:
     logger.log_text(f"Using Fold: {config['data']['params']['fold']}")
 
     # 模型
-    model = MambaEMAModel(**config["model"]["params"])
+    model = MultimodalEmotionModel(**config["model"]["params"])
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -277,7 +284,6 @@ def main() -> None:
             optimizer,
             loss_fn,
             device,
-            logger,
             config["train"]["grad_clip"],
             accumulation_steps,
             valence_weight,

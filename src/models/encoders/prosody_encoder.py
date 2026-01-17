@@ -1,15 +1,14 @@
 """Prosody encoder that loads cached eGeMAPS features."""
 
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
 
 
 class ProsodyEncoder(nn.Module):
-    """Prosody encoder using cached eGeMAPS features.
-    """
+    """Prosody encoder using cached eGeMAPS features with in-memory cache."""
 
     def __init__(
         self,
@@ -22,6 +21,7 @@ class ProsodyEncoder(nn.Module):
         self.feature_dir = Path(feature_dir)
         self.d_input = d_input
         self.d_output = d_output
+        self._feature_cache: Dict[str, torch.Tensor] = {}
 
         self.mlp = nn.Sequential(
             nn.Linear(d_input, hidden_dim),
@@ -31,19 +31,20 @@ class ProsodyEncoder(nn.Module):
         )
 
     def forward(self, names: List[str]) -> torch.Tensor:
-
         device = next(self.mlp.parameters()).device
 
-        # Load features
         features = []
         for name in names:
-            feature_path = self.feature_dir / f"{name}.pt"
-            if not feature_path.exists():
-                raise FileNotFoundError(f"Feature not found: {feature_path}")
+            if name not in self._feature_cache:
+                feature_path = self.feature_dir / f"{name}.pt"
+                if not feature_path.exists():
+                    raise FileNotFoundError(f"Feature not found: {feature_path}")
+                feature = torch.load(feature_path, map_location="cpu", weights_only=True)
+                self._feature_cache[name] = feature
 
-            feature = torch.load(feature_path, map_location=device, weights_only=True)  # [d_input]
+            feature = self._feature_cache[name].to(device)
             features.append(feature)
 
-        features = torch.stack(features)  # [B, d_input]
+        features = torch.stack(features)
 
-        return self.mlp(features)  # [B, d_output]
+        return self.mlp(features)

@@ -206,3 +206,69 @@ class SpeechEncoder(nn.Module):
     def _is_frozen(self) -> bool:
         """Check if model is frozen."""
         return not next(self.model.parameters()).requires_grad
+
+
+class OfflineSpeechEncoder(nn.Module):
+    """Lightweight encoder for pre-extracted WavLM features.
+
+    This encoder processes pre-extracted features, optionally applying:
+    - Learnable layer weights (if features were extracted from multiple layers)
+    - Linear projection
+
+    For offline mode, features are already extracted and stored as [T, D] tensors.
+    """
+
+    def __init__(
+        self,
+        d_input: int = 1024,
+        d_output: int = 1024,
+        num_layers: int = None,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.d_input = d_input
+        self.d_output = d_output
+
+        # Optional learnable layer weights (for weighted layer fusion at runtime)
+        if num_layers is not None and num_layers > 1:
+            self.layer_weights = nn.Parameter(torch.ones(num_layers) / num_layers)
+        else:
+            self.layer_weights = None
+
+        # Optional projection if dimensions differ
+        if d_input != d_output:
+            self.projection = nn.Sequential(
+                nn.Linear(d_input, d_output),
+                nn.LayerNorm(d_output),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.projection = None
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        padding_mask: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Process pre-extracted features.
+
+        Args:
+            features: [B, T, D] pre-extracted WavLM features
+            padding_mask: [B, T] bool mask (True for padding positions)
+
+        Returns:
+            features: [B, T, D] processed features
+            padding_mask: [B, T] padding mask (unchanged)
+        """
+        # Apply projection if needed
+        if self.projection is not None:
+            features = self.projection(features)
+
+        # Return features and mask
+        if padding_mask is None:
+            padding_mask = torch.zeros(
+                features.shape[0], features.shape[1],
+                dtype=torch.bool, device=features.device
+            )
+
+        return features, padding_mask
