@@ -10,6 +10,7 @@ from .encoders.speaker_encoder import OfflineSpeakerEncoder, SpeakerEncoder
 from .encoders.speech_encoder import OfflineSpeechEncoder, SpeechEncoder
 from .modules.cross_attention import CrossAttention
 from .modules.film import FiLM
+from .modules.layer_fusion import LearnableLayerFusion
 from .modules.mamba_updater import MambaUpdater
 
 
@@ -40,6 +41,7 @@ class MultimodalEmotionModel(nn.Module):
         mamba_n_layers: int = 2,
         # Offline mode
         use_offline_features: bool = False,
+        num_wavlm_layers: int = 4,
     ) -> None:
         super().__init__()
         self.use_cross_attention = use_cross_attention
@@ -48,6 +50,7 @@ class MultimodalEmotionModel(nn.Module):
 
         # Initialize encoders based on mode
         if use_offline_features:
+            self.layer_fusion = LearnableLayerFusion(num_layers=num_wavlm_layers)
             self.speech_encoder = OfflineSpeechEncoder(
                 d_input=d_speech, d_output=d_speech, dropout=dropout,
             )
@@ -168,13 +171,16 @@ class MultimodalEmotionModel(nn.Module):
         device = next(self.parameters()).device
 
         # Load pre-extracted features from batch
-        wavlm = batch["wavlm"].to(device)  # [B, T, D]
+        wavlm = batch["wavlm"].to(device)  # [B, L, T, D] multi-layer features
         wavlm_mask = batch["wavlm_mask"].to(device)  # [B, T]
         ecapa = batch["ecapa"].to(device)  # [B, 192]
         egemaps = batch["egemaps"].to(device)  # [B, 88]
 
+        # Learnable layer fusion: [B, L, T, D] -> [B, T, D]
+        wavlm_fused = self.layer_fusion(wavlm)
+
         # Process features through lightweight encoders
-        h_seq, _ = self.speech_encoder(wavlm, wavlm_mask)  # [B, T, D]
+        h_seq, _ = self.speech_encoder(wavlm_fused, wavlm_mask)  # [B, T, D]
         s = self.speaker_encoder(ecapa)  # [B, d_speaker]
         p = self.prosody_encoder(egemaps)  # [B, d_prosody_out]
 

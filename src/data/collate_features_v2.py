@@ -52,7 +52,7 @@ def collate_fn_features_v2(batch: List[Dict]) -> Dict[str, any]:
 
     Returns:
         dict with:
-            - wavlm: Tensor [B, T_max, D] padded sequences
+            - wavlm: Tensor [B, L, T_max, D] padded multi-layer sequences
             - wavlm_mask: Tensor [B, T_max] bool (True = padding)
             - ecapa: Tensor [B, 192]
             - egemaps_lld: Tensor [B, T_max, D_lld] aligned LLDs
@@ -81,9 +81,25 @@ def collate_fn_features_v2(batch: List[Dict]) -> Dict[str, any]:
     wavlm_lengths = [item["wavlm_length"] for item in batch]
     max_len = max(wavlm_lengths)
 
-    # WavLM: variable-length [T, D] -> padded [B, T_max, D]
-    wavlm_features = [item["wavlm"] for item in batch]
-    padded_wavlm = pad_sequence(wavlm_features, batch_first=True, padding_value=0.0)
+    # WavLM: check if multi-layer [L, T, D] or single-layer [T, D]
+    first_wavlm = batch[0]["wavlm"]
+    is_multilayer = first_wavlm.dim() == 3
+
+    if is_multilayer:
+        # Multi-layer: [L, T, D] -> padded [B, L, T_max, D]
+        num_layers = first_wavlm.shape[0]
+        d_model = first_wavlm.shape[2]
+
+        padded_wavlm = torch.zeros(len(batch), num_layers, max_len, d_model)
+        for i, item in enumerate(batch):
+            T = item["wavlm_length"]
+            padded_wavlm[i, :, :T, :] = item["wavlm"]
+    else:
+        # Single-layer (old format): [T, D] -> [B, 1, T_max, D] for compatibility
+        d_model = first_wavlm.shape[1]
+        wavlm_features = [item["wavlm"] for item in batch]
+        padded_single = pad_sequence(wavlm_features, batch_first=True, padding_value=0.0)
+        padded_wavlm = padded_single.unsqueeze(1)  # [B, 1, T, D]
 
     # Create padding mask
     mask = torch.zeros(len(batch), max_len, dtype=torch.bool)

@@ -169,8 +169,12 @@ class FeatureDataset(Dataset):
         arousal = float(row["A"])
 
         if self.normalize_vad:
-            valence = (valence - 1.0) / 4.0
-            arousal = (arousal - 1.0) / 4.0
+            if self.dataset_type == "IEMOCAP":
+                valence = (valence - 1.0) / 4.0  # [1, 5] -> [0, 1]
+                arousal = (arousal - 1.0) / 4.0
+            else:  # CCSEMO
+                valence = (valence + 2.0) / 4.0  # [-2, 2] -> [0, 1]
+                arousal = (arousal - 1.0) / 4.0  # [1, 5] -> [0, 1]
 
         result["valence"] = valence
         result["arousal"] = arousal

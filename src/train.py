@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -24,7 +25,7 @@ from metrics.ccc_metric import CCCMetric
 from models.mamba_ema_model import MultimodalEmotionModel
 from models.ms_mamba_model import MSMambaModel
 from utils.checkpoint import save_checkpoint
-from utils.config import apply_overrides, load_config, load_yaml
+from utils.config import load_config 
 from utils.experiment import init_experiment
 from utils.seed import set_seed
 

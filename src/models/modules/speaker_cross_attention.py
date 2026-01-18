@@ -1,7 +1,7 @@
 """Speaker-Aware Cross-Attention module.
 
-Uses Global Mamba output as Query and Speaker embedding as Key/Value
-to calibrate the final representation against speaker baseline.
+Uses Speaker embedding as Query and sequence features as Key/Value.
+Speaker queries the sequence to aggregate relevant frame information.
 """
 
 import torch
@@ -9,17 +9,14 @@ import torch.nn as nn
 
 
 class SpeakerAwareCrossAttention(nn.Module):
-    """Cross-attention with speaker embedding as Key/Value.
+    """Cross-attention with speaker embedding as Query.
 
-    Global Mamba output queries speaker embedding to calibrate
-    the final representation against speaker baseline.
-
-    This ensures the emotion prediction is relative to the speaker's
-    typical speaking patterns, not absolute acoustic values.
+    Speaker embedding queries sequence features to aggregate
+    speaker-relevant information from all frames.
 
     Args:
-        d_query: Query dimension (from Global Mamba output)
-        d_speaker: Speaker embedding dimension
+        d_seq: Sequence feature dimension (K/V)
+        d_speaker: Speaker embedding dimension (Q)
         d_hidden: Hidden/output dimension
         num_heads: Number of attention heads
         dropout: Dropout rate
@@ -27,7 +24,7 @@ class SpeakerAwareCrossAttention(nn.Module):
 
     def __init__(
         self,
-        d_query: int = 256,
+        d_seq: int = 1152,
         d_speaker: int = 192,
         d_hidden: int = 256,
         num_heads: int = 4,
@@ -36,8 +33,8 @@ class SpeakerAwareCrossAttention(nn.Module):
         super().__init__()
         assert d_hidden % num_heads == 0, "d_hidden must be divisible by num_heads"
 
-        self.query_proj = nn.Linear(d_query, d_hidden)
-        self.kv_proj = nn.Linear(d_speaker, d_hidden)
+        self.query_proj = nn.Linear(d_speaker, d_hidden)  # Q: speaker
+        self.kv_proj = nn.Linear(d_seq, d_hidden)  # K/V: sequence
 
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=d_hidden,
@@ -51,31 +48,33 @@ class SpeakerAwareCrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(
-        self,
-        query: torch.Tensor,
-        speaker: torch.Tensor,
+        self, sequence: torch.Tensor, speaker: torch.Tensor, mask: torch.Tensor = None
     ) -> torch.Tensor:
         """Apply speaker-aware cross-attention.
 
         Args:
-            query: [B, D_q] from Global Mamba (emotion representation)
-            speaker: [B, D_s] speaker embedding (speaker baseline)
+            sequence: [B, T, D_seq] sequence features (K/V)
+            speaker: [B, D_speaker] speaker embedding (Q)
+            mask: [B, T] padding mask (True = padding, will be ignored)
 
         Returns:
-            output: [B, d_hidden] speaker-calibrated representation
+            output: [B, d_hidden] aggregated representation
         """
-        # Expand to sequence dim: [B, D] -> [B, 1, D]
-        q = self.query_proj(query.unsqueeze(1))  # [B, 1, d_hidden]
+        # Q: speaker as single query token [B, 1, d_hidden]
+        q = self.query_proj(speaker.unsqueeze(1))
 
-        # Speaker as single K/V token: [B, 1, d_hidden]
-        kv = self.kv_proj(speaker.unsqueeze(1))
+        # K/V: sequence features [B, T, d_hidden]
+        kv = self.kv_proj(sequence)
 
-        # Cross-attention
-        attn_out, _ = self.multihead_attn(query=q, key=kv, value=kv)
+        # Cross-attention: speaker queries sequence
+        # key_padding_mask expects True for positions to ignore
+        attn_out, _ = self.multihead_attn(
+            query=q, key=kv, value=kv, key_padding_mask=mask
+        )
 
-        # Residual + Norm
+        # Residual + Norm + Output projection
         out = self.layer_norm(attn_out + q)
         out = self.out_proj(out)
         out = self.dropout(out)
 
-        return out.squeeze(1)  # [B, d_hidden]
+        return out.squeeze(1)  # [B, 1, D] -> [B, D]

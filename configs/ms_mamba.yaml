@@ -1,5 +1,5 @@
 # MS-Mamba: Multi-Source Adaptive Sliding-Mamba for SER
-# Uses frame-level LLD features and Sobel-based keyframe selection
+# Uses frame-level LLD features, processes all frames (no keyframe selection)
 
 experiment:
   name: ms_mamba_iemocap
@@ -14,7 +14,7 @@ data:
     label_file: data/labels/IEMOCAP/iemocap_label.csv
     feature_root: data/features/IEMOCAP  # Contains wavlm/, ecapa/, egemaps_lld/
     fold: 1
-    normalize_vad: true
+    normalize_vad: false
 
   loader:
     batch_size: 16
@@ -25,13 +25,16 @@ model:
   name: MSMamba
   params:
     # Input dimensions
-    d_speech: 1024          # WavLM-Large hidden size
-    d_prosody_in: 25        # eGeMAPS LLD dimension (check actual dim after extraction)
+    d_speech: 1024          # WavLM-Large hidden size (no reduction)
+    d_prosody_in: 25        # eGeMAPS LLD dimension
     d_speaker: 192          # ECAPA-TDNN dimension
 
     # Projection dimensions
-    d_proj: 512             # Projected dimension for both streams
-    d_hidden: 256           # Hidden dimension throughout
+    d_prosody_proj: 128     # Small projection for LLDs only
+    d_hidden: 1152          # = d_speech + d_prosody_proj, no compression
+
+    # Learnable layer fusion
+    num_wavlm_layers: 4     # Number of WavLM layers (12, 18, 21, 24)
 
     # Speaker-Adaptive LayerNorm
     use_sa_ln: true
@@ -41,26 +44,19 @@ model:
     local_mamba:
       window_size: 32
       n_layers: 1
-      d_model: 256
+      d_model: 1152         # No compression
       d_state: 16
       d_conv: 4
       expand: 2
 
-    # Sobel Edge Detector
-    sobel:
-      loudness_weight: 0.6
-      pitch_weight: 0.4
-      top_k_ratio: 0.1
-      min_keyframes: 8
-      max_keyframes: 64
-
-    # Sparse Global Mamba
+    # Global Mamba (processes all frames)
     global_mamba:
       n_layers: 2
-      d_model: 256
+      d_model: 1152         # No compression
       d_state: 16
       d_conv: 4
       expand: 2
+      pooling: mean         # mean, last, or max
 
     # Speaker-Aware Cross-Attention
     speaker_attn:
@@ -82,7 +78,7 @@ train:
 
   optimizer:
     name: AdamW
-    lr: 0.0005
+    lr: 0.0001
     weight_decay: 0.0001
 
   scheduler:

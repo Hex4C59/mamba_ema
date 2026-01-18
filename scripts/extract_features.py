@@ -65,19 +65,24 @@ class WavLMExtractor:
         """Extract features from waveform.
 
         Returns:
-            dict with 'features' [T, D] and 'length' int
+            dict with:
+                - 'features': [num_layers, T, D] multi-layer features
+                - 'length': int
+                - 'layers': list of layer indices
         """
         waveform = waveform.to(self.device).unsqueeze(0)  # [1, T]
         outputs = self.model(waveform)
 
-        # Extract and average specified layers
+        # Extract specified layers, keep them separate for learnable fusion
         hidden_states = outputs.hidden_states  # tuple of [1, T', D]
-        layer_features = [hidden_states[i] for i in self.layers]
-        # Average across layers: [1, T', D]
-        features = torch.stack(layer_features, dim=0).mean(dim=0)
-        features = features.squeeze(0)  # [T', D]
+        layer_features = [hidden_states[i].squeeze(0) for i in self.layers]  # list of [T', D]
+        features = torch.stack(layer_features, dim=0)  # [num_layers, T', D]
 
-        return {"features": features.cpu(), "length": features.shape[0]}
+        return {
+            "features": features.cpu(),
+            "length": features.shape[1],
+            "layers": self.layers,
+        }
 
 
 class ECAPAExtractor:

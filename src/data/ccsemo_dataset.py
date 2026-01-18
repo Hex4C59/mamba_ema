@@ -51,7 +51,7 @@ class CCSEMODataset(Dataset):
         CCSEMO CSV format:
             audio_path,name,V,A,gender,duration,discrete_emotion,split_set,transcript
 
-        Note: VA range is [-5, 5], need to normalize to [0, 1] if normalize_vad=True
+        Note: V range is [-2, 2], A range is [1, 5]
         """
         df = pd.read_csv(self.label_file)
 
@@ -61,10 +61,10 @@ class CCSEMODataset(Dataset):
         if len(df) == 0:
             raise ValueError(f"No samples found for split={self.split} in {self.label_file}")
 
-        # Normalize VA from [-5, 5] to [0, 1] if needed
+        # Normalize VA to [0, 1] if needed
         if self.normalize_vad:
-            df["V"] = (df["V"] + 5) / 10  # [-5, 5] -> [0, 1]
-            df["A"] = (df["A"] + 5) / 10
+            df["V"] = (df["V"] + 2) / 4  # [-2, 2] -> [0, 1]
+            df["A"] = (df["A"] - 1) / 4  # [1, 5] -> [0, 1]
 
         return df.reset_index(drop=True)
 

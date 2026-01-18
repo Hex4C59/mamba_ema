@@ -18,14 +18,12 @@ def create_exp_dir(base_dir, exp_name):
 
 # 初始化实验结果目录
 def init_experiment(config):
-
     base_dir = config.get("experiment", {}).get("base_dir", "runs")
     exp_name = config.get("experiment", {}).get("name", "exp")
-
-    dataset_name = config.get("data", {}).get("name", "unknown")
     fold = config.get("data", {}).get("params", {}).get("fold", None)
 
-    exp_name = f"{exp_name}_{dataset_name.lower()}_fold{fold}"
+    if fold is not None:
+        exp_name = f"{exp_name}_fold{fold}"
     exp_dir = create_exp_dir(base_dir, exp_name)
 
     logger = ExpLogger(exp_dir, config)

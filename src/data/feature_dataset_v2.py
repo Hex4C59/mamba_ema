@@ -24,7 +24,7 @@ class FeatureDatasetV2(Dataset):
     """Dataset for MS-Mamba with frame-level LLD support.
 
     Loads:
-    - WavLM: [T, 1024] variable-length sequence features
+    - WavLM: [L, T, 1024] multi-layer variable-length sequence features
     - ECAPA-TDNN: [192] fixed speaker embedding
     - eGeMAPS LLDs: [T', D] frame-level prosodic features (D ~ 23)
 
@@ -112,8 +112,9 @@ class FeatureDatasetV2(Dataset):
 
         Returns:
             dict with:
-                - wavlm: Tensor [T, 1024]
+                - wavlm: Tensor [L, T, 1024] multi-layer features
                 - wavlm_length: int
+                - num_layers: int
                 - ecapa: Tensor [192]
                 - egemaps_lld: Tensor [T', D] frame-level LLDs
                 - lld_length: int
@@ -128,12 +129,13 @@ class FeatureDatasetV2(Dataset):
         name = row["name"]
         result = {"name": name}
 
-        # Load WavLM
+        # Load WavLM (multi-layer)
         wavlm_path = self.feature_root / "wavlm" / f"{name}.pt"
         if wavlm_path.exists():
             data = _load_pt(wavlm_path)
-            result["wavlm"] = data["features"]  # [T, D]
+            result["wavlm"] = data["features"]  # [L, T, D] or [T, D] for old format
             result["wavlm_length"] = data["length"]
+            result["num_layers"] = data.get("layers", None)  # layer indices if available
         else:
             raise FileNotFoundError(f"WavLM feature not found: {wavlm_path}")
 
@@ -160,8 +162,12 @@ class FeatureDatasetV2(Dataset):
         arousal = float(row["A"])
 
         if self.normalize_vad:
-            valence = (valence - 1.0) / 4.0
-            arousal = (arousal - 1.0) / 4.0
+            if self.dataset_type == "IEMOCAP":
+                valence = (valence - 1.0) / 4.0  # [1, 5] -> [0, 1]
+                arousal = (arousal - 1.0) / 4.0
+            else:  # CCSEMO
+                valence = (valence + 2.0) / 4.0  # [-2, 2] -> [0, 1]
+                arousal = (arousal - 1.0) / 4.0  # [1, 5] -> [0, 1]
 
         result["valence"] = valence
         result["arousal"] = arousal

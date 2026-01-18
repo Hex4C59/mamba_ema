@@ -4,7 +4,6 @@ import yaml
 import copy
 
 def load_config(path):
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -13,6 +12,10 @@ def load_config(path):
         config = yaml.safe_load(f)
 
     return config
+
+
+# Alias for consistency with save_yaml
+load_yaml = load_config
 
 
 def save_yaml(data: dict, path: Union[str, Path]) -> None:
