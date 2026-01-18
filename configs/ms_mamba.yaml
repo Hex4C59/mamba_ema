@@ -1,0 +1,96 @@
+# MS-Mamba: Multi-Source Adaptive Sliding-Mamba for SER
+# Uses frame-level LLD features and Sobel-based keyframe selection
+
+experiment:
+  name: ms_mamba_iemocap
+  base_dir: runs
+
+data:
+  name: IEMOCAP
+  use_offline_features: true
+  use_lld_features: true  # Enable frame-level LLD mode
+
+  params:
+    label_file: data/labels/IEMOCAP/iemocap_label.csv
+    feature_root: data/features/IEMOCAP  # Contains wavlm/, ecapa/, egemaps_lld/
+    fold: 1
+    normalize_vad: true
+
+  loader:
+    batch_size: 16
+    shuffle: true
+    num_workers: 4
+
+model:
+  name: MSMamba
+  params:
+    # Input dimensions
+    d_speech: 1024          # WavLM-Large hidden size
+    d_prosody_in: 25        # eGeMAPS LLD dimension (check actual dim after extraction)
+    d_speaker: 192          # ECAPA-TDNN dimension
+
+    # Projection dimensions
+    d_proj: 512             # Projected dimension for both streams
+    d_hidden: 256           # Hidden dimension throughout
+
+    # Speaker-Adaptive LayerNorm
+    use_sa_ln: true
+    sa_ln_hidden: 128
+
+    # Windowed Local Mamba
+    local_mamba:
+      window_size: 32
+      n_layers: 1
+      d_model: 256
+      d_state: 16
+      d_conv: 4
+      expand: 2
+
+    # Sobel Edge Detector
+    sobel:
+      loudness_weight: 0.6
+      pitch_weight: 0.4
+      top_k_ratio: 0.1
+      min_keyframes: 8
+      max_keyframes: 64
+
+    # Sparse Global Mamba
+    global_mamba:
+      n_layers: 2
+      d_model: 256
+      d_state: 16
+      d_conv: 4
+      expand: 2
+
+    # Speaker-Aware Cross-Attention
+    speaker_attn:
+      num_heads: 4
+
+    # General
+    dropout: 0.2
+
+loss:
+  name: CCC
+
+metric:
+  name: CCC
+
+train:
+  epochs: 50
+  seed: 42
+  gpu_id: 0
+
+  optimizer:
+    name: AdamW
+    lr: 0.0005
+    weight_decay: 0.0001
+
+  scheduler:
+    name: CosineAnnealing
+    T_max: 50
+
+  grad_clip: 1.0
+
+  early_stopping:
+    patience: 10
+    min_delta: 0.001

@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -16,13 +15,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data.ccsemo_dataset import CCSEMODataset
 from data.collate import collate_fn_baseline
 from data.collate_features import collate_fn_features
+from data.collate_features_v2 import collate_fn_features_v2
 from data.feature_dataset import FeatureDataset
+from data.feature_dataset_v2 import FeatureDatasetV2
 from data.iemocap_dataset import IEMOCAPDataset
 from losses.ccc_loss import CCCLoss
 from metrics.ccc_metric import CCCMetric
 from models.mamba_ema_model import MultimodalEmotionModel
+from models.ms_mamba_model import MSMambaModel
 from utils.checkpoint import save_checkpoint
-from utils.config import apply_overrides, load_yaml
+from utils.config import apply_overrides, load_config, load_yaml
 from utils.experiment import init_experiment
 from utils.seed import set_seed
 
@@ -32,15 +34,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, required=True, help="Config file")
     parser.add_argument("--fold", type=int, default=None, help="Fold number (1-5)")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use")
-    parser.add_argument("overrides", nargs="*", help="Config overrides (key=value)")
     return parser.parse_args()
 
 
 def build_dataloader(config: dict, split: str) -> DataLoader:
     use_offline = config["data"].get("use_offline_features", False)
+    use_lld = config["data"].get("use_lld_features", False)
     dataset_name = config["data"]["name"]
 
-    if use_offline:
+    if use_lld:
+        # MS-Mamba mode: use LLD features
+        dataset = FeatureDatasetV2(
+            label_file=config["data"]["params"]["label_file"],
+            feature_root=config["data"]["params"]["feature_root"],
+            split=split,
+            fold=config["data"]["params"].get("fold", 1),
+            normalize_vad=config["data"]["params"].get("normalize_vad", True),
+        )
+        collate_fn = collate_fn_features_v2
+    elif use_offline:
         # Offline mode: load pre-extracted features
         dataset = FeatureDataset(
             label_file=config["data"]["params"]["label_file"],
@@ -161,11 +173,10 @@ def validate(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, metric: n
     return metrics
 
 
-def main() -> None:
+def main():
     args = parse_args()
 
-    config = load_yaml(args.config)
-    config = apply_overrides(config, args.overrides)
+    config = load_config(args.config)
 
     if args.fold is not None:
         config["data"]["params"]["fold"] = args.fold
@@ -182,15 +193,12 @@ def main() -> None:
     logger.log_text(f"Using Fold: {config['data']['params']['fold']}")
 
     # 模型
-    model = MultimodalEmotionModel(**config["model"]["params"])
+    model_name = config["model"].get("name", "MambaEMA")
+    if model_name == "MSMamba":
+        model = MSMambaModel(**config["model"]["params"])
+    else:
+        model = MultimodalEmotionModel(**config["model"]["params"])
     model = model.to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.log_text(f"Total params: {total_params / 1e6:.2f}M")
-    logger.log_text(
-        f"Trainable params: {trainable_params / 1e6:.2f}M ({trainable_params / total_params * 100:.1f}%)"
-    )
 
     train_loader = build_dataloader(config, split="train")
     val_loader = build_dataloader(config, split="val")
@@ -199,75 +207,20 @@ def main() -> None:
     loss_fn = CCCLoss()
     metric = CCCMetric()
 
-    # 解冻预训练模型编码器，并实现差异学习率优化器
-    freeze_speech_encoder = config["model"]["params"].get("freeze_speech_encoder", True)
-
-    if not freeze_speech_encoder:
-        # 解冻时使用差异学习率
-        encoder_lr = config["train"]["optimizer"].get("encoder_lr", 1e-5)
-        base_lr = config["train"]["optimizer"]["lr"]
-
-        logger.log_text("Using differential learning rates:")
-        logger.log_text(f"  Speech encoder: {encoder_lr}")
-        logger.log_text(f"  Other params: {base_lr}")
-
-        param_groups = [
-            # Speech encoder (WavLM) 使用小学习率
-            {
-                "params": model.speech_encoder.model.parameters(),
-                "lr": encoder_lr,
-                "name": "speech_encoder",
-            },
-            # Layer weights 使用正常学习率
-            {
-                "params": [model.speech_encoder.layer_weights]
-                if hasattr(model.speech_encoder, "layer_weights")
-                else [],
-                "lr": base_lr,
-                "name": "layer_weights",
-            },
-            # 其他所有参数使用正常学习率
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if "speech_encoder" not in n and p.requires_grad
-                ],
-                "lr": base_lr,
-                "name": "other_params",
-            },
-        ]
-
-        optimizer = AdamW(
-            param_groups,
-            weight_decay=config["train"]["optimizer"]["weight_decay"],
-        )
-    else:
-        # 冻结时使用统一学习率
-        optimizer = AdamW(
-            model.parameters(),
-            lr=config["train"]["optimizer"]["lr"],
-            weight_decay=config["train"]["optimizer"]["weight_decay"],
-        )
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config["train"]["optimizer"]["lr"],
+        weight_decay=config["train"]["optimizer"]["weight_decay"],
+    )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config["train"]["epochs"]
     )
 
-    # Initialize gradient scaler for mixed precision training
-    use_amp = config["train"].get("use_amp", True)
-    scaler = GradScaler() if use_amp and device == "cuda" else None
-    if scaler is not None:
-        logger.log_text("Using mixed precision training (FP16)")
-
     best_metric = -float("inf")
     patience = config["train"]["early_stopping"]["patience"]
     min_delta = config["train"]["early_stopping"]["min_delta"]
     patience_counter = 0
-
-    accumulation_steps = config["train"].get("accumulation_steps", 1)
-    if accumulation_steps > 1:
-        logger.log_text(f"Using gradient accumulation: {accumulation_steps} steps")
 
     loss_params = config.get("loss", {}).get("params", {})
     valence_weight = loss_params.get("valence_weight", 1.0)
@@ -285,10 +238,8 @@ def main() -> None:
             loss_fn,
             device,
             config["train"]["grad_clip"],
-            accumulation_steps,
             valence_weight,
             arousal_weight,
-            scaler,
         )
         logger.log(train_metrics, epoch, "train")
         logger.log_text(f"Train Loss: {train_metrics['loss']:.4f}")
