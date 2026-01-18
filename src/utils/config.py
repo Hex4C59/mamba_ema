@@ -1,9 +1,9 @@
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, List, Union
 import yaml
 import copy
 
-def load_yaml(path: Union[str, Path]) -> dict:
+def load_config(path):
 
     path = Path(path)
     if not path.exists():
@@ -12,7 +12,7 @@ def load_yaml(path: Union[str, Path]) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    return config if config is not None else {}
+    return config
 
 
 def save_yaml(data: dict, path: Union[str, Path]) -> None:
