@@ -3,7 +3,29 @@
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+
+
+def resample_pitch(pitch: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Resample pitch sequence to target length using interpolation.
+
+    Args:
+        pitch: [T_orig] 1D pitch sequence
+        target_len: Target sequence length
+
+    Returns:
+        [T_target] resampled pitch
+    """
+    if len(pitch) == target_len:
+        return pitch
+    if len(pitch) == 0:
+        return torch.zeros(target_len)
+
+    # Use F.interpolate for resampling
+    pitch_2d = pitch.unsqueeze(0).unsqueeze(0)  # [1, 1, T_orig]
+    resampled = F.interpolate(pitch_2d, size=target_len, mode="linear", align_corners=False)
+    return resampled.squeeze(0).squeeze(0)  # [T_target]
 
 
 def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
@@ -76,5 +98,27 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
     # eGeMAPS: fixed [88] -> stacked [B, 88]
     if "egemaps" in batch[0]:
         result["egemaps"] = torch.stack([item["egemaps"] for item in batch])
+
+    # Pitch: variable-length, resample to WavLM frame rate and pad
+    if "pitch" in batch[0]:
+        wavlm_lengths = result.get("wavlm_lengths", None)
+
+        pitch_list = []
+        for i, item in enumerate(batch):
+            pitch = item["pitch"]  # [T_pitch]
+            # Resample pitch to WavLM frame rate (Praat ~10ms hop -> WavLM ~20ms hop)
+            target_len = wavlm_lengths[i] if wavlm_lengths else len(pitch) // 2
+            pitch_resampled = resample_pitch(pitch, target_len)
+            pitch_list.append(pitch_resampled.unsqueeze(-1))  # [T, 1]
+
+        # Pad to max length
+        max_len = max(p.size(0) for p in pitch_list)
+        padded_pitch = torch.zeros(len(batch), max_len, 1)
+        for i, p in enumerate(pitch_list):
+            padded_pitch[i, :p.size(0), :] = p
+
+        result["pitch"] = padded_pitch  # [B, T, 1]
+        # Reuse wavlm_mask for pitch since they're aligned
+        result["pitch_mask"] = result.get("wavlm_mask", None)
 
     return result

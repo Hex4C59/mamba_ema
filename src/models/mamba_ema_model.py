@@ -42,11 +42,15 @@ class MultimodalEmotionModel(nn.Module):
         # Offline mode
         use_offline_features: bool = False,
         num_wavlm_layers: int = 4,
+        # Pitch (sequence-level prosody)
+        use_pitch: bool = False,
+        d_pitch_out: int = 64,
     ) -> None:
         super().__init__()
         self.use_cross_attention = use_cross_attention
         self.use_mamba = use_mamba
         self.use_offline_features = use_offline_features
+        self.use_pitch = use_pitch
 
         # Initialize encoders based on mode
         if use_offline_features:
@@ -57,13 +61,27 @@ class MultimodalEmotionModel(nn.Module):
             self.speaker_encoder = OfflineSpeakerEncoder(
                 d_input=192, d_output=d_speaker, normalize=True,
             )
-            # Prosody encoder uses offline features (already loads from files)
-            self.prosody_encoder = nn.Sequential(
-                nn.Linear(d_prosody_in, 128),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(128, d_prosody_out),
-            )
+
+            if use_pitch:
+                # Pitch encoder: [B, T, 1] -> [B, T, d_pitch_out]
+                self.pitch_encoder = nn.Sequential(
+                    nn.Linear(1, d_pitch_out),
+                    nn.LayerNorm(d_pitch_out),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+                self.prosody_encoder = None
+                d_fused = d_speech + d_pitch_out
+            else:
+                # Original eGeMAPS path
+                self.prosody_encoder = nn.Sequential(
+                    nn.Linear(d_prosody_in, 128),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(128, d_prosody_out),
+                )
+                self.pitch_encoder = None
+                d_fused = d_speech + d_prosody_out
         else:
             self.speech_encoder = SpeechEncoder(
                 model_name=speech_encoder_name,
@@ -82,10 +100,12 @@ class MultimodalEmotionModel(nn.Module):
                 d_output=d_speaker,
                 normalize=True,
             )
+            self.pitch_encoder = None
+            d_fused = d_speech + d_prosody_out
 
         self.film = FiLM(speaker_dim=d_speaker, feat_dim=d_speech, hidden_dim=256)
 
-        if use_cross_attention:
+        if use_cross_attention and not use_offline_features:
             self.cross_attention = CrossAttention(
                 d_query=d_prosody_out,
                 d_kv=d_speech,
@@ -95,9 +115,13 @@ class MultimodalEmotionModel(nn.Module):
                 expand_query=cross_attention_expand_query,
             )
             d_fused = d_hidden
-        else:
+        elif not use_offline_features:
+            # Online mode without cross-attention
             self.cross_attention = None
             d_fused = d_speech + d_prosody_out
+        else:
+            # Offline mode: d_fused already set above
+            self.cross_attention = None
 
         if use_mamba:
             self.mamba = MambaUpdater(
@@ -174,7 +198,6 @@ class MultimodalEmotionModel(nn.Module):
         wavlm = batch["wavlm"].to(device)  # [B, L, T, D] multi-layer features
         wavlm_mask = batch["wavlm_mask"].to(device)  # [B, T]
         ecapa = batch["ecapa"].to(device)  # [B, 192]
-        egemaps = batch["egemaps"].to(device)  # [B, 88]
 
         # Learnable layer fusion: [B, L, T, D] -> [B, T, D]
         wavlm_fused = self.layer_fusion(wavlm)
@@ -182,15 +205,21 @@ class MultimodalEmotionModel(nn.Module):
         # Process features through lightweight encoders
         h_seq, _ = self.speech_encoder(wavlm_fused, wavlm_mask)  # [B, T, D]
         s = self.speaker_encoder(ecapa)  # [B, d_speaker]
-        p = self.prosody_encoder(egemaps)  # [B, d_prosody_out]
 
         # FiLM modulation
         s_expanded = s.unsqueeze(1).expand(-1, h_seq.size(1), -1)
         h_seq_mod = self.film(h_seq, s_expanded)
 
-        # Fusion
-        p_expanded = p.unsqueeze(1).expand(-1, h_seq.size(1), -1)
-        z = torch.cat([h_seq_mod, p_expanded], dim=-1)
+        # Fusion: Pitch concat or eGeMAPS concat
+        if self.use_pitch:
+            pitch = batch["pitch"].to(device)  # [B, T, 1]
+            p = self.pitch_encoder(pitch)  # [B, T, d_pitch_out]
+            z = torch.cat([h_seq_mod, p], dim=-1)  # [B, T, d_speech + d_pitch_out]
+        else:
+            egemaps = batch["egemaps"].to(device)  # [B, 88]
+            p = self.prosody_encoder(egemaps)  # [B, d_prosody_out]
+            p_expanded = p.unsqueeze(1).expand(-1, h_seq.size(1), -1)
+            z = torch.cat([h_seq_mod, p_expanded], dim=-1)
 
         if self.use_mamba:
             z = self.mamba(z)

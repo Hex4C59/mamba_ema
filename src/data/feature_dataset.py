@@ -8,6 +8,7 @@ import warnings
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -33,6 +34,7 @@ class FeatureDataset(Dataset):
         fold: Fold number for cross-validation (IEMOCAP: 1-5)
         normalize_vad: Normalize VA to [0, 1]
         features: List of features to load (default: ["wavlm", "ecapa", "egemaps"])
+        pitch_root: Root directory for pitch features (.npy files)
     """
 
     def __init__(
@@ -43,6 +45,7 @@ class FeatureDataset(Dataset):
         fold: int = 1,
         normalize_vad: bool = True,
         features: list[str] = None,
+        pitch_root: str = None,
     ):
         self.label_file = label_file
         self.feature_root = Path(feature_root)
@@ -50,6 +53,7 @@ class FeatureDataset(Dataset):
         self.fold = fold
         self.normalize_vad = normalize_vad
         self.features = features or ["wavlm", "ecapa", "egemaps"]
+        self.pitch_root = Path(pitch_root) if pitch_root else None
 
         # Detect dataset type from label file path
         if "IEMOCAP" in label_file:
@@ -163,6 +167,19 @@ class FeatureDataset(Dataset):
                 result["egemaps"] = _load_pt(egemaps_path)
             else:
                 raise FileNotFoundError(f"eGeMAPS feature not found: {egemaps_path}")
+
+        if "pitch" in self.features:
+            if self.pitch_root is None:
+                raise ValueError("pitch_root must be set when loading pitch features")
+            # Remove .wav extension if present in name
+            stem = name.replace(".wav", "")
+            pitch_path = self.pitch_root / f"{stem}.npy"
+            if pitch_path.exists():
+                pitch_data = np.load(pitch_path)  # [T_pitch] 1D array
+                result["pitch"] = torch.from_numpy(pitch_data).float()
+                result["pitch_length"] = len(pitch_data)
+            else:
+                raise FileNotFoundError(f"Pitch feature not found: {pitch_path}")
 
         # Load labels
         valence = float(row["V"])
