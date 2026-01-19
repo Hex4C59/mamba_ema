@@ -7,10 +7,9 @@ import torch.nn as nn
 
 from .encoders.prosody_encoder import ProsodyEncoder
 from .encoders.speaker_encoder import OfflineSpeakerEncoder, SpeakerEncoder
-from .encoders.speech_encoder import OfflineSpeechEncoder, SpeechEncoder
+from .encoders.speech_encoder import SpeechEncoder
 from .modules.cross_attention import CrossAttention
 from .modules.film import FiLM
-from .modules.layer_fusion import LearnableLayerFusion
 from .modules.mamba_updater import MambaUpdater
 
 
@@ -41,8 +40,6 @@ class MultimodalEmotionModel(nn.Module):
         mamba_n_layers: int = 2,
         # Offline mode
         use_offline_features: bool = False,
-        num_wavlm_layers: int = 4,
-        wavlm_layer_index: int = None,  # 固定使用某一层 (0-indexed in stored features)
         # Pitch (sequence-level prosody)
         use_pitch: bool = False,
     ) -> None:
@@ -51,18 +48,11 @@ class MultimodalEmotionModel(nn.Module):
         self.use_mamba = use_mamba
         self.use_offline_features = use_offline_features
         self.use_pitch = use_pitch
-        self.wavlm_layer_index = wavlm_layer_index
 
         # Initialize encoders based on mode
         if use_offline_features:
-            # 如果指定了 wavlm_layer_index，则不需要 layer_fusion
-            if wavlm_layer_index is not None:
-                self.layer_fusion = None
-            else:
-                self.layer_fusion = LearnableLayerFusion(num_layers=num_wavlm_layers)
-            self.speech_encoder = OfflineSpeechEncoder(
-                d_input=d_speech, d_output=d_speech, dropout=dropout,
-            )
+            # Offline mode: no speech encoder needed, wavlm features used directly
+            self.speech_encoder = None
             self.speaker_encoder = OfflineSpeakerEncoder(
                 d_input=d_speaker, d_output=d_speaker, normalize=True,
             )
@@ -199,18 +189,11 @@ class MultimodalEmotionModel(nn.Module):
         device = next(self.parameters()).device
 
         # Load pre-extracted features from batch
-        wavlm = batch["wavlm"].to(device)  # [B, L, T, D] multi-layer features
+        h_seq = batch["wavlm"].to(device)  # [B, T, D] single-layer features
         wavlm_mask = batch["wavlm_mask"].to(device)  # [B, T]
         xvector = batch["xvector"].to(device)  # [B, 512]
 
-        # Layer selection: 固定某一层 or 可学习融合
-        if self.wavlm_layer_index is not None:
-            wavlm_fused = wavlm[:, self.wavlm_layer_index, :, :]  # [B, T, D]
-        else:
-            wavlm_fused = self.layer_fusion(wavlm)  # [B, T, D]
-
-        # Process features through lightweight encoders
-        h_seq, _ = self.speech_encoder(wavlm_fused, wavlm_mask)  # [B, T, D]
+        # Speaker encoder
         s = self.speaker_encoder(xvector)  # [B, d_speaker]
 
         # FiLM modulation

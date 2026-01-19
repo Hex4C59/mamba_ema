@@ -32,9 +32,9 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
     """Collate function for offline feature datasets.
 
     Handles:
-    - WavLM: Variable-length sequences -> padded + mask
-    - X-Vector: Fixed [512] -> stacked
-    - eGeMAPS: Fixed [88] -> stacked
+    - WavLM: Variable-length [T, D] sequences -> padded [B, T_max, D] + mask
+    - X-Vector: Fixed [512] -> stacked [B, 512]
+    - eGeMAPS: Fixed [88] -> stacked [B, 88]
 
     Args:
         batch: List of samples from FeatureDataset
@@ -61,25 +61,12 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
     result["valence"] = torch.tensor([item["valence"] for item in batch], dtype=torch.float32)
     result["arousal"] = torch.tensor([item["arousal"] for item in batch], dtype=torch.float32)
 
-    # WavLM: variable-length, supports both [T, D] and [L, T, D] (multi-layer)
+    # WavLM: variable-length [T, D] -> [B, T_max, D]
     if "wavlm" in batch[0]:
         lengths = [item["wavlm_length"] for item in batch]
         max_len = max(lengths)
-
-        first_wavlm = batch[0]["wavlm"]
-        is_multilayer = first_wavlm.dim() == 3
-
-        if is_multilayer:
-            # Multi-layer: [L, T, D] -> [B, L, T_max, D]
-            num_layers, _, d_model = first_wavlm.shape
-            padded = torch.zeros(len(batch), num_layers, max_len, d_model)
-            for i, item in enumerate(batch):
-                T = item["wavlm_length"]
-                padded[i, :, :T, :] = item["wavlm"]
-        else:
-            # Single-layer: [T, D] -> [B, T_max, D]
-            wavlm_features = [item["wavlm"] for item in batch]
-            padded = pad_sequence(wavlm_features, batch_first=True, padding_value=0.0)
+        wavlm_features = [item["wavlm"] for item in batch]
+        padded = pad_sequence(wavlm_features, batch_first=True, padding_value=0.0)
 
         # Create padding mask (True for padding positions)
         mask = torch.zeros(len(batch), max_len, dtype=torch.bool)

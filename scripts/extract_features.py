@@ -7,7 +7,7 @@ Usage:
         --output_dir data/features/IEMOCAP \
         --features wavlm xvector \
         --wavlm_model pretrained_model/wavlm-large \
-        --wavlm_layers 6 12 18 24
+        --wavlm_layer 12
 
     # 使用 X-Vector
     uv run python scripts/extract_features.py \
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--features", nargs="+", default=["wavlm", "xvector"],
                         choices=["wavlm", "xvector", "campp"], help="Features to extract")
     parser.add_argument("--wavlm_model", type=str, default="pretrained_model/wavlm-large")
-    parser.add_argument("--wavlm_layers", type=int, nargs="+", default=[6, 12, 18, 24])
+    parser.add_argument("--wavlm_layer", type=int, default=12, help="WavLM layer to extract")
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--gpu", type=int, default=0, help="GPU ID")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (1 for safety)")
@@ -57,12 +57,12 @@ def load_audio(audio_path: str, sample_rate: int = 16000) -> torch.Tensor:
 
 
 class WavLMExtractor:
-    """Extract WavLM features."""
+    """Extract WavLM features from a single layer."""
 
-    def __init__(self, model_path: str, layers: list[int], device: str):
+    def __init__(self, model_path: str, layer: int, device: str):
         self.device = device
-        self.layers = layers
-        print(f"Loading WavLM from {model_path}...")
+        self.layer = layer
+        print(f"Loading WavLM from {model_path}, extracting layer {layer}...")
         self.model = AutoModel.from_pretrained(model_path)
         self.model.config.output_hidden_states = True
         self.model.to(device)
@@ -74,23 +74,16 @@ class WavLMExtractor:
 
         Returns:
             dict with:
-                - 'features': [num_layers, T, D] multi-layer features
+                - 'features': [T, D] single-layer features
                 - 'length': int
-                - 'layers': list of layer indices
+                - 'layer': int layer index
         """
         waveform = waveform.to(self.device).unsqueeze(0)  # [1, T]
         outputs = self.model(waveform)
-
-        # Extract specified layers, keep them separate for learnable fusion
         hidden_states = outputs.hidden_states  # tuple of [1, T', D]
-        layer_features = [hidden_states[i].squeeze(0) for i in self.layers]  # list of [T', D]
-        features = torch.stack(layer_features, dim=0)  # [num_layers, T', D]
+        features = hidden_states[self.layer].squeeze(0)  # [T', D]
 
-        return {
-            "features": features.cpu(),
-            "length": features.shape[1],
-            "layers": self.layers,
-        }
+        return {"features": features.cpu(), "length": features.shape[0], "layer": self.layer}
 
 
 class XVectorExtractor:
@@ -188,7 +181,7 @@ def main():
     # Initialize extractors
     extractors = {}
     if "wavlm" in args.features:
-        extractors["wavlm"] = WavLMExtractor(args.wavlm_model, args.wavlm_layers, device)
+        extractors["wavlm"] = WavLMExtractor(args.wavlm_model, args.wavlm_layer, device)
     if "xvector" in args.features:
         extractors["xvector"] = XVectorExtractor(device)
     if "campp" in args.features:
@@ -236,7 +229,7 @@ def main():
         "audio_root": str(args.audio_root),
         "features": args.features,
         "wavlm_model": args.wavlm_model if "wavlm" in args.features else None,
-        "wavlm_layers": args.wavlm_layers if "wavlm" in args.features else None,
+        "wavlm_layer": args.wavlm_layer if "wavlm" in args.features else None,
         "sample_rate": args.sample_rate,
         "stats": stats,
     }
