@@ -21,9 +21,9 @@ from data.feature_dataset import FeatureDataset
 from data.feature_dataset_v2 import FeatureDatasetV2
 from data.iemocap_dataset import IEMOCAPDataset
 from losses.ccc_loss import CCCLoss
+from losses.mse_loss import MSELoss
 from metrics.ccc_metric import CCCMetric
 from models.mamba_ema_model import MultimodalEmotionModel
-from models.ms_mamba_model import MSMambaModel
 from utils.checkpoint import save_checkpoint
 from utils.config import load_config 
 from utils.experiment import init_experiment
@@ -195,18 +195,19 @@ def main():
     logger.log_text(f"Using Fold: {config['data']['params']['fold']}")
 
     # 模型
-    model_name = config["model"].get("name", "MambaEMA")
-    if model_name == "MSMamba":
-        model = MSMambaModel(**config["model"]["params"])
-    else:
-        model = MultimodalEmotionModel(**config["model"]["params"])
+    model = MultimodalEmotionModel(**config["model"]["params"])
     model = model.to(device)
 
     train_loader = build_dataloader(config, split="train")
     val_loader = build_dataloader(config, split="val")
     test_loader = build_dataloader(config, split="test")
 
-    loss_fn = CCCLoss()
+    loss_name = config.get("loss", {}).get("name", "CCC")
+    if loss_name == "MSE":
+        train_loss_fn = MSELoss()
+    else:
+        train_loss_fn = CCCLoss()
+    val_loss_fn = CCCLoss()  # 验证始终用 CCC
     metric = CCCMetric()
 
     optimizer = AdamW(
@@ -237,7 +238,7 @@ def main():
             model,
             train_loader,
             optimizer,
-            loss_fn,
+            train_loss_fn,
             device,
             config["train"]["grad_clip"],
             valence_weight,
@@ -246,7 +247,7 @@ def main():
         logger.log(train_metrics, epoch, "train")
         logger.log_text(f"Train Loss: {train_metrics['loss']:.4f}")
 
-        val_metrics = validate(model, val_loader, loss_fn, metric, device)
+        val_metrics = validate(model, val_loader, val_loss_fn, metric, device)
         logger.log(val_metrics, epoch, "val")
         logger.log_text(
             f"Val - CCC-V: {val_metrics['ccc_v']:.3f}, "
