@@ -1,7 +1,7 @@
 """Feature dataset for offline training with pre-extracted features.
 
-This module loads pre-extracted WavLM, ECAPA-TDNN, and eGeMAPS features
-instead of extracting them on-the-fly during training.
+This module loads pre-extracted WavLM, speaker embeddings (X-Vector or CAM++),
+and eGeMAPS features instead of extracting them on-the-fly during training.
 """
 
 import warnings
@@ -24,16 +24,16 @@ def _load_pt(path: Path) -> torch.Tensor:
 class FeatureDataset(Dataset):
     """Dataset for loading pre-extracted features.
 
-    Loads WavLM (variable-length), ECAPA-TDNN (fixed), and eGeMAPS (fixed) features
+    Loads WavLM (variable-length), X-Vector (fixed), and eGeMAPS (fixed) features
     from pre-computed .pt files.
 
     Args:
         label_file: Path to CSV label file (IEMOCAP or CCSEMO format)
-        feature_root: Root directory containing feature subdirs (wavlm/, ecapa/, egemaps/)
+        feature_root: Root directory containing feature subdirs (wavlm/, xvector/, egemaps/)
         split: "train", "val", or "test"
         fold: Fold number for cross-validation (IEMOCAP: 1-5)
         normalize_vad: Normalize VA to [0, 1]
-        features: List of features to load (default: ["wavlm", "ecapa", "egemaps"])
+        features: List of features to load (default: ["wavlm", "xvector", "egemaps"])
         pitch_root: Root directory for pitch features (.npy files)
     """
 
@@ -52,7 +52,7 @@ class FeatureDataset(Dataset):
         self.split = split
         self.fold = fold
         self.normalize_vad = normalize_vad
-        self.features = features or ["wavlm", "ecapa", "egemaps"]
+        self.features = features or ["wavlm", "xvector", "egemaps"]
         self.pitch_root = Path(pitch_root) if pitch_root else None
 
         # Detect dataset type from label file path
@@ -132,7 +132,7 @@ class FeatureDataset(Dataset):
             dict with:
                 - wavlm: Tensor [T, 1024] (variable length)
                 - wavlm_length: int
-                - ecapa: Tensor [192]
+                - xvector: Tensor [512]
                 - egemaps: Tensor [88]
                 - valence: float
                 - arousal: float
@@ -154,12 +154,19 @@ class FeatureDataset(Dataset):
             else:
                 raise FileNotFoundError(f"WavLM feature not found: {wavlm_path}")
 
-        if "ecapa" in self.features:
-            ecapa_path = self.feature_root / "ecapa" / f"{name}.pt"
-            if ecapa_path.exists():
-                result["ecapa"] = _load_pt(ecapa_path)
+        if "xvector" in self.features:
+            xvector_path = self.feature_root / "xvector" / f"{name}.pt"
+            if xvector_path.exists():
+                result["xvector"] = _load_pt(xvector_path)
             else:
-                raise FileNotFoundError(f"ECAPA feature not found: {ecapa_path}")
+                raise FileNotFoundError(f"X-Vector feature not found: {xvector_path}")
+
+        if "campp" in self.features:
+            campp_path = self.feature_root / "campp" / f"{name}.pt"
+            if campp_path.exists():
+                result["xvector"] = _load_pt(campp_path)  # 复用 xvector 键名，模型兼容
+            else:
+                raise FileNotFoundError(f"CAM++ feature not found: {campp_path}")
 
         if "egemaps" in self.features:
             egemaps_path = self.feature_root / "egemaps" / f"{name}.pt"

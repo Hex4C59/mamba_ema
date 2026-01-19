@@ -22,13 +22,13 @@ class MultimodalEmotionModel(nn.Module):
         speech_encoder_layers: list = None,
         speech_encoder_pooling: str = "mean",
         prosody_feature_dir: str = "data/features/IEMOCAP/egemaps",
-        speaker_encoder_name: str = "speechbrain/spkrec-ecapa-voxceleb",
+        speaker_encoder_name: str = "speechbrain/spkrec-xvect-voxceleb",
         freeze_speech_encoder: bool = True,
         # Feature dimensions
         d_speech: int = 1024,
         d_prosody_in: int = 88,
         d_prosody_out: int = 64,
-        d_speaker: int = 192,
+        d_speaker: int = 512,
         d_hidden: int = 256,
         dropout: float = 0.2,
         # Fusion modules
@@ -42,36 +42,36 @@ class MultimodalEmotionModel(nn.Module):
         # Offline mode
         use_offline_features: bool = False,
         num_wavlm_layers: int = 4,
+        wavlm_layer_index: int = None,  # 固定使用某一层 (0-indexed in stored features)
         # Pitch (sequence-level prosody)
         use_pitch: bool = False,
-        d_pitch_out: int = 64,
     ) -> None:
         super().__init__()
         self.use_cross_attention = use_cross_attention
         self.use_mamba = use_mamba
         self.use_offline_features = use_offline_features
         self.use_pitch = use_pitch
+        self.wavlm_layer_index = wavlm_layer_index
 
         # Initialize encoders based on mode
         if use_offline_features:
-            self.layer_fusion = LearnableLayerFusion(num_layers=num_wavlm_layers)
+            # 如果指定了 wavlm_layer_index，则不需要 layer_fusion
+            if wavlm_layer_index is not None:
+                self.layer_fusion = None
+            else:
+                self.layer_fusion = LearnableLayerFusion(num_layers=num_wavlm_layers)
             self.speech_encoder = OfflineSpeechEncoder(
                 d_input=d_speech, d_output=d_speech, dropout=dropout,
             )
             self.speaker_encoder = OfflineSpeakerEncoder(
-                d_input=192, d_output=d_speaker, normalize=True,
+                d_input=d_speaker, d_output=d_speaker, normalize=True,
             )
 
             if use_pitch:
-                # Pitch encoder: [B, T, 1] -> [B, T, d_pitch_out]
-                self.pitch_encoder = nn.Sequential(
-                    nn.Linear(1, d_pitch_out),
-                    nn.LayerNorm(d_pitch_out),
-                    nn.ReLU(),
-                    nn.Dropout(dropout),
-                )
+                # Pitch: directly use [B, T, 1], no encoder needed
+                self.pitch_encoder = None
                 self.prosody_encoder = None
-                d_fused = d_speech + d_pitch_out
+                d_fused = d_speech  # Mamba only processes speech
             else:
                 # Original eGeMAPS path
                 self.prosody_encoder = nn.Sequential(
@@ -136,6 +136,10 @@ class MultimodalEmotionModel(nn.Module):
             self.mamba = None
             d_final = d_fused
 
+        # Add pitch dim (concat after mamba, before pool)
+        if use_offline_features and use_pitch:
+            d_final = d_final + 1  # pitch is [B, T, 1]
+
         self.regression_head = nn.Sequential(
             nn.Linear(d_final, d_hidden),
             nn.LayerNorm(d_hidden),
@@ -197,24 +201,25 @@ class MultimodalEmotionModel(nn.Module):
         # Load pre-extracted features from batch
         wavlm = batch["wavlm"].to(device)  # [B, L, T, D] multi-layer features
         wavlm_mask = batch["wavlm_mask"].to(device)  # [B, T]
-        ecapa = batch["ecapa"].to(device)  # [B, 192]
+        xvector = batch["xvector"].to(device)  # [B, 512]
 
-        # Learnable layer fusion: [B, L, T, D] -> [B, T, D]
-        wavlm_fused = self.layer_fusion(wavlm)
+        # Layer selection: 固定某一层 or 可学习融合
+        if self.wavlm_layer_index is not None:
+            wavlm_fused = wavlm[:, self.wavlm_layer_index, :, :]  # [B, T, D]
+        else:
+            wavlm_fused = self.layer_fusion(wavlm)  # [B, T, D]
 
         # Process features through lightweight encoders
         h_seq, _ = self.speech_encoder(wavlm_fused, wavlm_mask)  # [B, T, D]
-        s = self.speaker_encoder(ecapa)  # [B, d_speaker]
+        s = self.speaker_encoder(xvector)  # [B, d_speaker]
 
         # FiLM modulation
         s_expanded = s.unsqueeze(1).expand(-1, h_seq.size(1), -1)
         h_seq_mod = self.film(h_seq, s_expanded)
 
-        # Fusion: Pitch concat or eGeMAPS concat
+        # Prepare z for Mamba (pitch is added after pool)
         if self.use_pitch:
-            pitch = batch["pitch"].to(device)  # [B, T, 1]
-            p = self.pitch_encoder(pitch)  # [B, T, d_pitch_out]
-            z = torch.cat([h_seq_mod, p], dim=-1)  # [B, T, d_speech + d_pitch_out]
+            z = h_seq_mod  # [B, T, d_speech]
         else:
             egemaps = batch["egemaps"].to(device)  # [B, 88]
             p = self.prosody_encoder(egemaps)  # [B, d_prosody_out]
@@ -222,17 +227,23 @@ class MultimodalEmotionModel(nn.Module):
             z = torch.cat([h_seq_mod, p_expanded], dim=-1)
 
         if self.use_mamba:
-            z = self.mamba(z)
+            z = self.mamba(z)  # [B, T, 256]
 
-        # Mean pooling (masked)
+        # Mean pooling mamba output (masked)
         if wavlm_mask is not None:
-            # Mask out padding positions before mean
             mask_expanded = (~wavlm_mask).unsqueeze(-1).float()  # [B, T, 1]
-            z = (z * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            z_pooled = (z * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
         else:
-            z = z.mean(dim=1)
+            z_pooled = z.mean(dim=1)  # [B, 256]
 
-        predictions = self.regression_head(z)
+        # Concat with pitch: [B, 256] + [B, T] -> [B, 256 + T]
+        if self.use_pitch:
+            pitch = batch["pitch"].to(device)  # [B, T]
+            z_final = torch.cat([z_pooled, pitch], dim=-1)  # [B, 256 + T]
+        else:
+            z_final = z_pooled
+
+        predictions = self.regression_head(z_final)
         valence_pred = predictions[:, 0]
         arousal_pred = predictions[:, 1]
 

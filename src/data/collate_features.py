@@ -33,7 +33,7 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
 
     Handles:
     - WavLM: Variable-length sequences -> padded + mask
-    - ECAPA: Fixed [192] -> stacked
+    - X-Vector: Fixed [512] -> stacked
     - eGeMAPS: Fixed [88] -> stacked
 
     Args:
@@ -44,7 +44,7 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
             - wavlm: Tensor [B, T_max, D] padded sequences
             - wavlm_mask: Tensor [B, T_max] bool (True = padding)
             - wavlm_lengths: List[int]
-            - ecapa: Tensor [B, 192]
+            - xvector: Tensor [B, 512]
             - egemaps: Tensor [B, 88]
             - valence: Tensor [B]
             - arousal: Tensor [B]
@@ -91,34 +91,32 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
         result["wavlm_mask"] = mask
         result["wavlm_lengths"] = lengths
 
-    # ECAPA: fixed [192] -> stacked [B, 192]
-    if "ecapa" in batch[0]:
-        result["ecapa"] = torch.stack([item["ecapa"] for item in batch])
+    # X-Vector: fixed [512] -> stacked [B, 512]
+    if "xvector" in batch[0]:
+        result["xvector"] = torch.stack([item["xvector"] for item in batch])
 
     # eGeMAPS: fixed [88] -> stacked [B, 88]
     if "egemaps" in batch[0]:
         result["egemaps"] = torch.stack([item["egemaps"] for item in batch])
 
-    # Pitch: variable-length, resample to WavLM frame rate and pad
+    # Pitch: variable-length, resample to WavLM frame rate and pad -> [B, T]
     if "pitch" in batch[0]:
         wavlm_lengths = result.get("wavlm_lengths", None)
 
         pitch_list = []
         for i, item in enumerate(batch):
             pitch = item["pitch"]  # [T_pitch]
-            # Resample pitch to WavLM frame rate (Praat ~10ms hop -> WavLM ~20ms hop)
+            # Resample pitch to WavLM frame rate
             target_len = wavlm_lengths[i] if wavlm_lengths else len(pitch) // 2
             pitch_resampled = resample_pitch(pitch, target_len)
-            pitch_list.append(pitch_resampled.unsqueeze(-1))  # [T, 1]
+            pitch_list.append(pitch_resampled)  # [T]
 
         # Pad to max length
         max_len = max(p.size(0) for p in pitch_list)
-        padded_pitch = torch.zeros(len(batch), max_len, 1)
+        padded_pitch = torch.zeros(len(batch), max_len)
         for i, p in enumerate(pitch_list):
-            padded_pitch[i, :p.size(0), :] = p
+            padded_pitch[i, :p.size(0)] = p
 
-        result["pitch"] = padded_pitch  # [B, T, 1]
-        # Reuse wavlm_mask for pitch since they're aligned
-        result["pitch_mask"] = result.get("wavlm_mask", None)
+        result["pitch"] = padded_pitch  # [B, T]
 
     return result
