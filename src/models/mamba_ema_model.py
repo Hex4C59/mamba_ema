@@ -12,6 +12,7 @@ from .modules.cross_attention import CrossAttention
 from .modules.film import FiLM
 from .modules.layer_fusion import LearnableLayerFusion
 from .modules.mamba_updater import MambaUpdater
+from .modules.transformer_updater import TransformerUpdater
 
 
 class MultimodalEmotionModel(nn.Module):
@@ -36,9 +37,11 @@ class MultimodalEmotionModel(nn.Module):
         cross_attention_heads: int = 4,
         cross_attention_expand_query: bool = True,
         use_mamba: bool = False,
+        use_transformer: bool = False,  # 使用 Transformer 替代 Mamba
         mamba_d_model: int = 256,
         mamba_d_output: int = 128,
         mamba_n_layers: int = 2,
+        transformer_n_heads: int = 8,  # Transformer attention heads
         # Pooling
         pooling: str = "mean",  # "mean" or "attention"
         # Offline mode
@@ -50,6 +53,7 @@ class MultimodalEmotionModel(nn.Module):
         super().__init__()
         self.use_cross_attention = use_cross_attention
         self.use_mamba = use_mamba
+        self.use_transformer = use_transformer
         self.use_offline_features = use_offline_features
         self.use_pitch = use_pitch
         self.pooling = pooling
@@ -133,9 +137,22 @@ class MultimodalEmotionModel(nn.Module):
                 n_layers=mamba_n_layers,
                 dropout=dropout,
             )
+            self.transformer = None
+            d_final = mamba_d_output
+        elif use_transformer:
+            self.transformer = TransformerUpdater(
+                d_input=d_fused,
+                d_model=mamba_d_model,
+                d_output=mamba_d_output,
+                n_layers=mamba_n_layers,
+                n_heads=transformer_n_heads,
+                dropout=dropout,
+            )
+            self.mamba = None
             d_final = mamba_d_output
         else:
             self.mamba = None
+            self.transformer = None
             d_final = d_fused
 
         # Attention pooling (only created if needed)
@@ -150,7 +167,8 @@ class MultimodalEmotionModel(nn.Module):
         if use_offline_features and use_pitch:
             d_final = d_final + 1  # pitch is [B, T, 1]
 
-        self.regression_head = nn.Sequential(
+        # Separate prediction heads for Valence and Arousal
+        self.valence_head = nn.Sequential(
             nn.Linear(d_final, d_hidden),
             nn.LayerNorm(d_hidden),
             nn.ReLU(),
@@ -159,7 +177,18 @@ class MultimodalEmotionModel(nn.Module):
             nn.LayerNorm(d_hidden // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_hidden // 2, 2),
+            nn.Linear(d_hidden // 2, 1),
+        )
+        self.arousal_head = nn.Sequential(
+            nn.Linear(d_final, d_hidden),
+            nn.LayerNorm(d_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, d_hidden // 2),
+            nn.LayerNorm(d_hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden // 2, 1),
         )
 
     def forward(self, batch: Dict[str, any]) -> Dict[str, torch.Tensor]:
@@ -195,6 +224,8 @@ class MultimodalEmotionModel(nn.Module):
 
         if self.use_mamba:
             z = self.mamba(z)
+        elif self.use_transformer:
+            z = self.transformer(z)
 
         # Pooling
         if self.pooling == "attention":
@@ -204,9 +235,8 @@ class MultimodalEmotionModel(nn.Module):
         else:
             z = z.mean(dim=1)  # [B, D]
 
-        predictions = self.regression_head(z)
-        valence_pred = predictions[:, 0]
-        arousal_pred = predictions[:, 1]
+        valence_pred = self.valence_head(z).squeeze(-1)
+        arousal_pred = self.arousal_head(z).squeeze(-1)
 
         return {"valence_pred": valence_pred, "arousal_pred": arousal_pred}
 
@@ -244,6 +274,8 @@ class MultimodalEmotionModel(nn.Module):
 
         if self.use_mamba:
             z = self.mamba(z)  # [B, T, 256]
+        elif self.use_transformer:
+            z = self.transformer(z, mask=wavlm_mask)  # [B, T, 256]
 
         # Pooling (with mask support)
         if self.pooling == "attention":
@@ -267,8 +299,7 @@ class MultimodalEmotionModel(nn.Module):
         else:
             z_final = z_pooled
 
-        predictions = self.regression_head(z_final)
-        valence_pred = predictions[:, 0]
-        arousal_pred = predictions[:, 1]
+        valence_pred = self.valence_head(z_final).squeeze(-1)
+        arousal_pred = self.arousal_head(z_final).squeeze(-1)
 
         return {"valence_pred": valence_pred, "arousal_pred": arousal_pred}
