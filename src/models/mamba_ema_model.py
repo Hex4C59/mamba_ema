@@ -10,6 +10,7 @@ from .encoders.speaker_encoder import OfflineSpeakerEncoder, SpeakerEncoder
 from .encoders.speech_encoder import SpeechEncoder
 from .modules.cross_attention import CrossAttention
 from .modules.film import FiLM
+from .modules.layer_fusion import LearnableLayerFusion
 from .modules.mamba_updater import MambaUpdater
 
 
@@ -38,8 +39,11 @@ class MultimodalEmotionModel(nn.Module):
         mamba_d_model: int = 256,
         mamba_d_output: int = 128,
         mamba_n_layers: int = 2,
+        # Pooling
+        pooling: str = "mean",  # "mean" or "attention"
         # Offline mode
         use_offline_features: bool = False,
+        num_wavlm_layers: int = 1,  # 多层融合：>1 时启用 LearnableLayerFusion
         # Pitch (sequence-level prosody)
         use_pitch: bool = False,
     ) -> None:
@@ -48,6 +52,14 @@ class MultimodalEmotionModel(nn.Module):
         self.use_mamba = use_mamba
         self.use_offline_features = use_offline_features
         self.use_pitch = use_pitch
+        self.pooling = pooling
+        self.num_wavlm_layers = num_wavlm_layers
+
+        # Layer fusion for multi-layer WavLM features
+        if use_offline_features and num_wavlm_layers > 1:
+            self.layer_fusion = LearnableLayerFusion(num_layers=num_wavlm_layers)
+        else:
+            self.layer_fusion = None
 
         # Initialize encoders based on mode
         if use_offline_features:
@@ -126,6 +138,14 @@ class MultimodalEmotionModel(nn.Module):
             self.mamba = None
             d_final = d_fused
 
+        # Attention pooling (only created if needed)
+        if pooling == "attention":
+            self.attn_pool = nn.Sequential(
+                nn.Linear(d_final, d_final // 2),
+                nn.Tanh(),
+                nn.Linear(d_final // 2, 1, bias=False),
+            )
+
         # Add pitch dim (concat after mamba, before pool)
         if use_offline_features and use_pitch:
             d_final = d_final + 1  # pitch is [B, T, 1]
@@ -176,7 +196,13 @@ class MultimodalEmotionModel(nn.Module):
         if self.use_mamba:
             z = self.mamba(z)
 
-        z = z.mean(dim=1)
+        # Pooling
+        if self.pooling == "attention":
+            attn_scores = self.attn_pool(z).squeeze(-1)  # [B, T]
+            attn_weights = torch.softmax(attn_scores, dim=1)  # [B, T]
+            z = (attn_weights.unsqueeze(-1) * z).sum(dim=1)  # [B, D]
+        else:
+            z = z.mean(dim=1)  # [B, D]
 
         predictions = self.regression_head(z)
         valence_pred = predictions[:, 0]
@@ -189,9 +215,16 @@ class MultimodalEmotionModel(nn.Module):
         device = next(self.parameters()).device
 
         # Load pre-extracted features from batch
-        h_seq = batch["wavlm"].to(device)  # [B, T, D] single-layer features
+        wavlm = batch["wavlm"].to(device)  # [B, T, D] or [B, L, T, D]
         wavlm_mask = batch["wavlm_mask"].to(device)  # [B, T]
         xvector = batch["xvector"].to(device)  # [B, 512]
+
+        # Layer fusion for multi-layer features
+        if self.layer_fusion is not None:
+            # [B, L, T, D] -> [B, T, D]
+            h_seq = self.layer_fusion(wavlm)
+        else:
+            h_seq = wavlm  # [B, T, D]
 
         # Speaker encoder
         s = self.speaker_encoder(xvector)  # [B, d_speaker]
@@ -212,12 +245,20 @@ class MultimodalEmotionModel(nn.Module):
         if self.use_mamba:
             z = self.mamba(z)  # [B, T, 256]
 
-        # Mean pooling mamba output (masked)
-        if wavlm_mask is not None:
-            mask_expanded = (~wavlm_mask).unsqueeze(-1).float()  # [B, T, 1]
-            z_pooled = (z * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+        # Pooling (with mask support)
+        if self.pooling == "attention":
+            attn_scores = self.attn_pool(z).squeeze(-1)  # [B, T]
+            if wavlm_mask is not None:
+                attn_scores = attn_scores.masked_fill(wavlm_mask, float("-inf"))
+            attn_weights = torch.softmax(attn_scores, dim=1)  # [B, T]
+            z_pooled = (attn_weights.unsqueeze(-1) * z).sum(dim=1)  # [B, D]
         else:
-            z_pooled = z.mean(dim=1)  # [B, 256]
+            # Masked mean pooling
+            if wavlm_mask is not None:
+                mask_expanded = (~wavlm_mask).unsqueeze(-1).float()  # [B, T, 1]
+                z_pooled = (z * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1)
+            else:
+                z_pooled = z.mean(dim=1)  # [B, D]
 
         # Concat with pitch: [B, 256] + [B, T] -> [B, 256 + T]
         if self.use_pitch:

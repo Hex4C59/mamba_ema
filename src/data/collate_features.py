@@ -32,7 +32,7 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
     """Collate function for offline feature datasets.
 
     Handles:
-    - WavLM: Variable-length [T, D] sequences -> padded [B, T_max, D] + mask
+    - WavLM: Single-layer [T, D] -> [B, T_max, D], or multi-layer [L, T, D] -> [B, L, T_max, D]
     - X-Vector: Fixed [512] -> stacked [B, 512]
     - eGeMAPS: Fixed [88] -> stacked [B, 88]
 
@@ -41,7 +41,7 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
 
     Returns:
         dict with:
-            - wavlm: Tensor [B, T_max, D] padded sequences
+            - wavlm: Tensor [B, T_max, D] or [B, L, T_max, D] padded sequences
             - wavlm_mask: Tensor [B, T_max] bool (True = padding)
             - wavlm_lengths: List[int]
             - xvector: Tensor [B, 512]
@@ -61,12 +61,24 @@ def collate_fn_features(batch: List[Dict]) -> Dict[str, any]:
     result["valence"] = torch.tensor([item["valence"] for item in batch], dtype=torch.float32)
     result["arousal"] = torch.tensor([item["arousal"] for item in batch], dtype=torch.float32)
 
-    # WavLM: variable-length [T, D] -> [B, T_max, D]
+    # WavLM: variable-length sequences
     if "wavlm" in batch[0]:
         lengths = [item["wavlm_length"] for item in batch]
         max_len = max(lengths)
         wavlm_features = [item["wavlm"] for item in batch]
-        padded = pad_sequence(wavlm_features, batch_first=True, padding_value=0.0)
+
+        # Detect single-layer [T, D] vs multi-layer [L, T, D]
+        if wavlm_features[0].dim() == 2:
+            # 单层模式: [T, D] -> [B, T_max, D]
+            padded = pad_sequence(wavlm_features, batch_first=True, padding_value=0.0)
+        else:
+            # 多层模式: [L, T, D] -> [B, L, T_max, D]
+            num_layers = wavlm_features[0].shape[0]
+            feat_dim = wavlm_features[0].shape[2]
+            padded = torch.zeros(len(batch), num_layers, max_len, feat_dim)
+            for i, feat in enumerate(wavlm_features):
+                t_len = feat.shape[1]
+                padded[i, :, :t_len, :] = feat
 
         # Create padding mask (True for padding positions)
         mask = torch.zeros(len(batch), max_len, dtype=torch.bool)

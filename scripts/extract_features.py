@@ -1,21 +1,30 @@
 """Extract WavLM and speaker embedding features for offline training.
 
 Usage:
+    # 提取多层 WavLM 特征（按层存放）
     uv run python scripts/extract_features.py \
         --label_file data/labels/IEMOCAP/iemocap_label.csv \
         --audio_root /tmp/IEMOCAP_full_release \
         --output_dir data/features/IEMOCAP \
         --features wavlm xvector \
         --wavlm_model pretrained_model/wavlm-large \
-        --wavlm_layer 12
+        --wavlm_layers 6 12 18 24
 
-    # 使用 X-Vector
+    # 只提取单层
     uv run python scripts/extract_features.py \
-        --features wavlm xvector ...
+        --wavlm_layers 12 ...
 
-    # 使用 CAM++ (Wespeaker)
-    uv run python scripts/extract_features.py \
-        --features wavlm campp ...
+特征存储结构:
+    data/features/IEMOCAP/
+    ├── wavlm/
+    │   ├── layer_6/
+    │   │   └── *.pt
+    │   ├── layer_12/
+    │   │   └── *.pt
+    │   └── ...
+    ├── xvector/
+    │   └── *.pt
+    └── metadata.json
 """
 
 import argparse
@@ -37,7 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--features", nargs="+", default=["wavlm", "xvector"],
                         choices=["wavlm", "xvector", "campp"], help="Features to extract")
     parser.add_argument("--wavlm_model", type=str, default="pretrained_model/wavlm-large")
-    parser.add_argument("--wavlm_layer", type=int, default=12, help="WavLM layer to extract")
+    parser.add_argument("--wavlm_layers", type=int, nargs="+", default=[12],
+                        help="WavLM layers to extract (e.g., 6 12 18 24)")
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--gpu", type=int, default=0, help="GPU ID")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size (1 for safety)")
@@ -57,12 +67,12 @@ def load_audio(audio_path: str, sample_rate: int = 16000) -> torch.Tensor:
 
 
 class WavLMExtractor:
-    """Extract WavLM features from a single layer."""
+    """Extract WavLM features from multiple layers."""
 
-    def __init__(self, model_path: str, layer: int, device: str):
+    def __init__(self, model_path: str, layers: list[int], device: str):
         self.device = device
-        self.layer = layer
-        print(f"Loading WavLM from {model_path}, extracting layer {layer}...")
+        self.layers = layers
+        print(f"Loading WavLM from {model_path}, extracting layers {layers}...")
         self.model = AutoModel.from_pretrained(model_path)
         self.model.config.output_hidden_states = True
         self.model.to(device)
@@ -73,17 +83,18 @@ class WavLMExtractor:
         """Extract features from waveform.
 
         Returns:
-            dict with:
-                - 'features': [T, D] single-layer features
-                - 'length': int
-                - 'layer': int layer index
+            dict with layer_idx -> {"features": [T, D], "length": int}
         """
         waveform = waveform.to(self.device).unsqueeze(0)  # [1, T]
         outputs = self.model(waveform)
         hidden_states = outputs.hidden_states  # tuple of [1, T', D]
-        features = hidden_states[self.layer].squeeze(0)  # [T', D]
 
-        return {"features": features.cpu(), "length": features.shape[0], "layer": self.layer}
+        result = {}
+        for layer_idx in self.layers:
+            features = hidden_states[layer_idx].squeeze(0)  # [T', D]
+            result[layer_idx] = {"features": features.cpu(), "length": features.shape[0]}
+
+        return result
 
 
 class XVectorExtractor:
@@ -174,14 +185,21 @@ def main():
     # Create output directories
     feature_dirs = {}
     for feat in args.features:
-        feat_dir = output_dir / feat
-        feat_dir.mkdir(parents=True, exist_ok=True)
-        feature_dirs[feat] = feat_dir
+        if feat == "wavlm":
+            # Create subdirs for each layer
+            for layer_idx in args.wavlm_layers:
+                layer_dir = output_dir / "wavlm" / f"layer_{layer_idx}"
+                layer_dir.mkdir(parents=True, exist_ok=True)
+                feature_dirs[f"wavlm_layer_{layer_idx}"] = layer_dir
+        else:
+            feat_dir = output_dir / feat
+            feat_dir.mkdir(parents=True, exist_ok=True)
+            feature_dirs[feat] = feat_dir
 
     # Initialize extractors
     extractors = {}
     if "wavlm" in args.features:
-        extractors["wavlm"] = WavLMExtractor(args.wavlm_model, args.wavlm_layer, device)
+        extractors["wavlm"] = WavLMExtractor(args.wavlm_model, args.wavlm_layers, device)
     if "xvector" in args.features:
         extractors["xvector"] = XVectorExtractor(device)
     if "campp" in args.features:
@@ -202,23 +220,42 @@ def main():
             continue
 
         for feat_name, extractor in extractors.items():
-            output_path = feature_dirs[feat_name] / f"{name}.pt"
-
-            if args.skip_existing and output_path.exists():
-                stats["skipped"] += 1
-                continue
-
             try:
                 if feat_name == "wavlm":
-                    result = extractor.extract(waveform)
-                    torch.save(result, output_path)
+                    # Check if all layers already exist
+                    all_exist = all(
+                        (feature_dirs[f"wavlm_layer_{layer}"] / f"{name}.pt").exists()
+                        for layer in args.wavlm_layers
+                    )
+                    if args.skip_existing and all_exist:
+                        stats["skipped"] += 1
+                        continue
+
+                    # Extract all layers at once
+                    layer_results = extractor.extract(waveform)
+                    for layer_idx, data in layer_results.items():
+                        output_path = feature_dirs[f"wavlm_layer_{layer_idx}"] / f"{name}.pt"
+                        torch.save(data, output_path)
+                    stats["wavlm"] += 1
+
                 elif feat_name == "xvector":
+                    output_path = feature_dirs["xvector"] / f"{name}.pt"
+                    if args.skip_existing and output_path.exists():
+                        stats["skipped"] += 1
+                        continue
                     embedding = extractor.extract(waveform)
                     torch.save(embedding, output_path)
+                    stats["xvector"] += 1
+
                 elif feat_name == "campp":
+                    output_path = feature_dirs["campp"] / f"{name}.pt"
+                    if args.skip_existing and output_path.exists():
+                        stats["skipped"] += 1
+                        continue
                     embedding = extractor.extract(waveform, audio_path=audio_path)
                     torch.save(embedding, output_path)
-                stats[feat_name] += 1
+                    stats["campp"] += 1
+
             except Exception as e:
                 print(f"Failed to extract {feat_name} for {name}: {e}")
                 stats["failed"] += 1
@@ -229,7 +266,7 @@ def main():
         "audio_root": str(args.audio_root),
         "features": args.features,
         "wavlm_model": args.wavlm_model if "wavlm" in args.features else None,
-        "wavlm_layer": args.wavlm_layer if "wavlm" in args.features else None,
+        "wavlm_layers": args.wavlm_layers if "wavlm" in args.features else None,
         "sample_rate": args.sample_rate,
         "stats": stats,
     }

@@ -62,6 +62,7 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
             fold=config["data"]["params"].get("fold", 1),
             normalize_vad=config["data"]["params"].get("normalize_vad", True),
             features=config["data"]["params"].get("features", ["wavlm", "ecapa", "egemaps"]),
+            wavlm_layers=config["data"]["params"].get("wavlm_layers"),
             pitch_root=config["data"]["params"].get("pitch_root"),
         )
         collate_fn = collate_fn_features

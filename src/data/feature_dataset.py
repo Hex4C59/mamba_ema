@@ -34,6 +34,8 @@ class FeatureDataset(Dataset):
         fold: Fold number for cross-validation (IEMOCAP: 1-5)
         normalize_vad: Normalize VA to [0, 1]
         features: List of features to load (default: ["wavlm", "xvector", "egemaps"])
+        wavlm_layers: List of WavLM layers to use (e.g., [1,2,3,4] or [12]).
+                      Single layer returns [T, D], multiple layers return [L, T, D].
         pitch_root: Root directory for pitch features (.npy files)
     """
 
@@ -45,6 +47,7 @@ class FeatureDataset(Dataset):
         fold: int = 1,
         normalize_vad: bool = True,
         features: list[str] = None,
+        wavlm_layers: list[int] = None,
         pitch_root: str = None,
     ):
         self.label_file = label_file
@@ -53,6 +56,7 @@ class FeatureDataset(Dataset):
         self.fold = fold
         self.normalize_vad = normalize_vad
         self.features = features or ["wavlm", "xvector", "egemaps"]
+        self.wavlm_layers = wavlm_layers or [12]  # 默认单层兼容
         self.pitch_root = Path(pitch_root) if pitch_root else None
 
         # Detect dataset type from label file path
@@ -68,7 +72,8 @@ class FeatureDataset(Dataset):
         # Feature cache for faster loading
         self._cache: Dict[str, Dict[str, torch.Tensor]] = {}
 
-        print(f"FeatureDataset: {len(self)} samples ({split}, fold={fold})")
+        layer_info = f", wavlm_layers={self.wavlm_layers}" if "wavlm" in self.features else ""
+        print(f"FeatureDataset: {len(self)} samples ({split}, fold={fold}{layer_info})")
 
     def _get_test_session(self) -> str:
         """Get test session for IEMOCAP."""
@@ -130,7 +135,7 @@ class FeatureDataset(Dataset):
 
         Returns:
             dict with:
-                - wavlm: Tensor [T, 1024] (variable length)
+                - wavlm: Tensor [T, D] (single layer) or [L, T, D] (multi-layer)
                 - wavlm_length: int
                 - xvector: Tensor [512]
                 - egemaps: Tensor [88]
@@ -146,13 +151,29 @@ class FeatureDataset(Dataset):
         result = {"name": name}
 
         if "wavlm" in self.features:
-            wavlm_path = self.feature_root / "wavlm" / f"{name}.pt"
-            if wavlm_path.exists():
-                data = _load_pt(wavlm_path)
-                result["wavlm"] = data["features"]  # [T, D]
-                result["wavlm_length"] = data["length"]
+            # Load from layer-specific directories: wavlm/layer_{n}/
+            if len(self.wavlm_layers) == 1:
+                # 单层模式：返回 [T, D]
+                layer = self.wavlm_layers[0]
+                wavlm_path = self.feature_root / "wavlm" / f"layer_{layer}" / f"{name}.pt"
+                if wavlm_path.exists():
+                    data = _load_pt(wavlm_path)
+                    result["wavlm"] = data["features"]  # [T, D]
+                    result["wavlm_length"] = data["length"]
+                else:
+                    raise FileNotFoundError(f"WavLM feature not found: {wavlm_path}")
             else:
-                raise FileNotFoundError(f"WavLM feature not found: {wavlm_path}")
+                # 多层模式：返回 [L, T, D]
+                layer_features = []
+                for layer in self.wavlm_layers:
+                    wavlm_path = self.feature_root / "wavlm" / f"layer_{layer}" / f"{name}.pt"
+                    if wavlm_path.exists():
+                        data = _load_pt(wavlm_path)
+                        layer_features.append(data["features"])  # [T, D]
+                    else:
+                        raise FileNotFoundError(f"WavLM feature not found: {wavlm_path}")
+                result["wavlm"] = torch.stack(layer_features, dim=0)  # [L, T, D]
+                result["wavlm_length"] = layer_features[0].shape[0]
 
         if "xvector" in self.features:
             xvector_path = self.feature_root / "xvector" / f"{name}.pt"
