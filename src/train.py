@@ -1,5 +1,6 @@
 import argparse
 import csv
+import random
 import sys
 from pathlib import Path
 
@@ -28,6 +29,39 @@ from utils.checkpoint import save_checkpoint
 from utils.config import load_config 
 from utils.experiment import init_experiment
 from utils.seed import set_seed
+
+
+def mixup_batch(
+    batch: dict, alpha: float = 0.4
+) -> tuple[dict, tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor], float]:
+    """对 batch 执行 mixup 增强
+
+    Args:
+        batch: 包含 wavlm, xvector, egemaps, valence, arousal 的字典
+        alpha: Beta 分布参数
+
+    Returns:
+        batch: 混合后的特征
+        targets_a: (valence_a, arousal_a) 原始标签
+        targets_b: (valence_b, arousal_b) 打乱后的标签
+        lam: 混合系数
+    """
+    lam = np.random.beta(alpha, alpha)
+    batch_size = batch["valence"].size(0)
+    index = torch.randperm(batch_size, device=batch["valence"].device)
+
+    # 混合特征
+    for key in ["wavlm", "xvector", "egemaps"]:
+        if key in batch and batch[key] is not None:
+            batch[key] = lam * batch[key] + (1 - lam) * batch[key][index]
+
+    # 掩码取并集
+    if "wavlm_mask" in batch:
+        batch["wavlm_mask"] = batch["wavlm_mask"] | batch["wavlm_mask"][index]
+
+    targets_a = (batch["valence"], batch["arousal"])
+    targets_b = (batch["valence"][index], batch["arousal"][index])
+    return batch, targets_a, targets_b, lam
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,12 +122,23 @@ def build_dataloader(config: dict, split: str) -> DataLoader:
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
+    # Worker seed 函数，确保多进程数据加载的可复现性
+    def worker_init_fn(worker_id):
+        worker_seed = torch.initial_seed() % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    generator = torch.Generator()
+    generator.manual_seed(config["train"]["seed"])
+
     loader = DataLoader(
         dataset,
         batch_size=config["data"]["loader"]["batch_size"],
         shuffle=config["data"]["loader"]["shuffle"] if split == "train" else False,
         num_workers=config["data"]["loader"]["num_workers"],
         collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )
 
     return loader
@@ -110,6 +155,7 @@ def train_one_epoch(
     valence_weight: float = 1.0,
     arousal_weight: float = 1.0,
     scaler: GradScaler = None,
+    mixup_alpha: float = 0.0,
 ) -> dict:
     model.train()
     total_loss = 0.0
@@ -119,11 +165,21 @@ def train_one_epoch(
         batch["valence"] = batch["valence"].to(device)
         batch["arousal"] = batch["arousal"].to(device)
 
+        # Mixup 增强
+        if mixup_alpha > 0:
+            batch, targets_a, targets_b, lam = mixup_batch(batch, mixup_alpha)
+
         with autocast(enabled=(scaler is not None)):
             output = model(batch)
 
-            loss_v = loss_fn(output["valence_pred"], batch["valence"])
-            loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
+            if mixup_alpha > 0:
+                loss_v = lam * loss_fn(output["valence_pred"], targets_a[0]) + \
+                         (1 - lam) * loss_fn(output["valence_pred"], targets_b[0])
+                loss_a = lam * loss_fn(output["arousal_pred"], targets_a[1]) + \
+                         (1 - lam) * loss_fn(output["arousal_pred"], targets_b[1])
+            else:
+                loss_v = loss_fn(output["valence_pred"], batch["valence"])
+                loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
             loss = (valence_weight * loss_v + arousal_weight * loss_a) / accumulation_steps
 
         if scaler is not None:
@@ -232,6 +288,10 @@ def main():
     if valence_weight != 1.0 or arousal_weight != 1.0:
         logger.log_text(f"Using weighted loss: V={valence_weight}, A={arousal_weight}")
 
+    mixup_alpha = config["train"].get("mixup_alpha", 0.0)
+    if mixup_alpha > 0:
+        logger.log_text(f"Using mixup with alpha={mixup_alpha}")
+
     for epoch in range(config["train"]["epochs"]):
         logger.log_text(f"\nEpoch {epoch + 1}/{config['train']['epochs']}")
 
@@ -242,8 +302,9 @@ def main():
             train_loss_fn,
             device,
             config["train"]["grad_clip"],
-            valence_weight,
-            arousal_weight,
+            valence_weight=valence_weight,
+            arousal_weight=arousal_weight,
+            mixup_alpha=mixup_alpha,
         )
         logger.log(train_metrics, epoch, "train")
         logger.log_text(f"Train Loss: {train_metrics['loss']:.4f}")

@@ -167,8 +167,8 @@ class MultimodalEmotionModel(nn.Module):
         if use_offline_features and use_pitch:
             d_final = d_final + 1  # pitch is [B, T, 1]
 
-        # Separate prediction heads for Valence and Arousal
-        self.valence_head = nn.Sequential(
+        # Shared prediction head for Valence and Arousal
+        self.prediction_head = nn.Sequential(
             nn.Linear(d_final, d_hidden),
             nn.LayerNorm(d_hidden),
             nn.ReLU(),
@@ -177,18 +177,7 @@ class MultimodalEmotionModel(nn.Module):
             nn.LayerNorm(d_hidden // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(d_hidden // 2, 1),
-        )
-        self.arousal_head = nn.Sequential(
-            nn.Linear(d_final, d_hidden),
-            nn.LayerNorm(d_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_hidden // 2),
-            nn.LayerNorm(d_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden // 2, 1),
+            nn.Linear(d_hidden // 2, 2),  # 输出 [V, A]
         )
 
     def forward(self, batch: Dict[str, any]) -> Dict[str, torch.Tensor]:
@@ -235,10 +224,8 @@ class MultimodalEmotionModel(nn.Module):
         else:
             z = z.mean(dim=1)  # [B, D]
 
-        valence_pred = self.valence_head(z).squeeze(-1)
-        arousal_pred = self.arousal_head(z).squeeze(-1)
-
-        return {"valence_pred": valence_pred, "arousal_pred": arousal_pred}
+        pred = self.prediction_head(z)  # [B, 2]
+        return {"valence_pred": pred[:, 0], "arousal_pred": pred[:, 1]}
 
     def _forward_offline(self, batch: Dict[str, any]) -> Dict[str, torch.Tensor]:
         """Forward pass with pre-extracted features."""
@@ -299,7 +286,5 @@ class MultimodalEmotionModel(nn.Module):
         else:
             z_final = z_pooled
 
-        valence_pred = self.valence_head(z_final).squeeze(-1)
-        arousal_pred = self.arousal_head(z_final).squeeze(-1)
-
-        return {"valence_pred": valence_pred, "arousal_pred": arousal_pred}
+        pred = self.prediction_head(z_final)  # [B, 2]
+        return {"valence_pred": pred[:, 0], "arousal_pred": pred[:, 1]}
