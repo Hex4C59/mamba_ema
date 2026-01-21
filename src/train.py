@@ -182,6 +182,13 @@ def train_one_epoch(
                 loss_a = loss_fn(output["arousal_pred"], batch["arousal"])
             loss = (valence_weight * loss_v + arousal_weight * loss_a) / accumulation_steps
 
+            # Add MoE auxiliary loss if applicable
+            if hasattr(model, "get_aux_loss"):
+                aux_loss = model.get_aux_loss()
+                if aux_loss.device != loss.device:
+                    aux_loss = aux_loss.to(loss.device)
+                loss = loss + aux_loss
+
         if scaler is not None:
             scaler.scale(loss).backward()
         else:

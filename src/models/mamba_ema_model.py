@@ -12,6 +12,8 @@ from .modules.cross_attention import CrossAttention
 from .modules.film import FiLM
 from .modules.layer_fusion import LearnableLayerFusion
 from .modules.mamba_updater import MambaUpdater
+from .modules.moe import MoEMambaUpdater
+from .modules.style_pooling import StylePoolingLayer
 from .modules.transformer_updater import TransformerUpdater
 
 
@@ -37,13 +39,18 @@ class MultimodalEmotionModel(nn.Module):
         cross_attention_heads: int = 4,
         cross_attention_expand_query: bool = True,
         use_mamba: bool = False,
+        use_moe_mamba: bool = False,  # 使用 MoE-Mamba 替代普通 Mamba
         use_transformer: bool = False,  # 使用 Transformer 替代 Mamba
         mamba_d_model: int = 256,
         mamba_d_output: int = 128,
         mamba_n_layers: int = 2,
+        moe_num_experts: int = 4,  # MoE expert 数量
+        moe_top_k: int = 2,  # 每个 token 路由到的 expert 数量
         transformer_n_heads: int = 8,  # Transformer attention heads
         # Pooling
-        pooling: str = "mean",  # "mean" or "attention"
+        pooling: str = "mean",  # "mean", "attention", or "style"
+        style_pooling_d_model: int = 1024,  # Style Pooling 内部维度
+        style_pooling_n_heads: int = 8,  # Style Pooling attention heads
         # Offline mode
         use_offline_features: bool = False,
         num_wavlm_layers: int = 1,  # 多层融合：>1 时启用 LearnableLayerFusion
@@ -53,11 +60,14 @@ class MultimodalEmotionModel(nn.Module):
         super().__init__()
         self.use_cross_attention = use_cross_attention
         self.use_mamba = use_mamba
+        self.use_moe_mamba = use_moe_mamba
         self.use_transformer = use_transformer
         self.use_offline_features = use_offline_features
         self.use_pitch = use_pitch
         self.pooling = pooling
         self.num_wavlm_layers = num_wavlm_layers
+        self.style_pooling_d_model = style_pooling_d_model
+        self.style_pooling_n_heads = style_pooling_n_heads
 
         # Layer fusion for multi-layer WavLM features
         if use_offline_features and num_wavlm_layers > 1:
@@ -137,6 +147,20 @@ class MultimodalEmotionModel(nn.Module):
                 n_layers=mamba_n_layers,
                 dropout=dropout,
             )
+            self.moe_mamba = None
+            self.transformer = None
+            d_final = mamba_d_output
+        elif use_moe_mamba:
+            self.moe_mamba = MoEMambaUpdater(
+                d_input=d_fused,
+                d_model=mamba_d_model,
+                d_output=mamba_d_output,
+                n_layers=mamba_n_layers,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                dropout=dropout,
+            )
+            self.mamba = None
             self.transformer = None
             d_final = mamba_d_output
         elif use_transformer:
@@ -149,36 +173,49 @@ class MultimodalEmotionModel(nn.Module):
                 dropout=dropout,
             )
             self.mamba = None
+            self.moe_mamba = None
             d_final = mamba_d_output
         else:
             self.mamba = None
+            self.moe_mamba = None
             self.transformer = None
             d_final = d_fused
 
-        # Attention pooling (only created if needed)
+        # Pooling modules
         if pooling == "attention":
             self.attn_pool = nn.Sequential(
                 nn.Linear(d_final, d_final // 2),
                 nn.Tanh(),
                 nn.Linear(d_final // 2, 1, bias=False),
             )
+        elif pooling == "style":
+            # Style Pooling Layer replaces mean pooling + prediction head
+            d_style_input = d_final + 1 if (use_offline_features and use_pitch) else d_final
+            self.style_pooling = StylePoolingLayer(
+                d_input=d_style_input,
+                d_model=style_pooling_d_model,
+                n_heads=style_pooling_n_heads,
+                dropout=dropout,
+                n_outputs=2,
+            )
 
         # Add pitch dim (concat after mamba, before pool)
         if use_offline_features and use_pitch:
             d_final = d_final + 1  # pitch is [B, T, 1]
 
-        # Shared prediction head for Valence and Arousal
-        self.prediction_head = nn.Sequential(
-            nn.Linear(d_final, d_hidden),
-            nn.LayerNorm(d_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden, d_hidden // 2),
-            nn.LayerNorm(d_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_hidden // 2, 2),  # 输出 [V, A]
-        )
+        # Shared prediction head for Valence and Arousal (not used in style pooling)
+        if pooling != "style":
+            self.prediction_head = nn.Sequential(
+                nn.Linear(d_final, d_hidden),
+                nn.LayerNorm(d_hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_hidden, d_hidden // 2),
+                nn.LayerNorm(d_hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_hidden // 2, 2),  # 输出 [V, A]
+            )
 
     def forward(self, batch: Dict[str, any]) -> Dict[str, torch.Tensor]:
         if self.use_offline_features:
@@ -213,11 +250,16 @@ class MultimodalEmotionModel(nn.Module):
 
         if self.use_mamba:
             z = self.mamba(z)
+        elif self.use_moe_mamba:
+            z = self.moe_mamba(z)
         elif self.use_transformer:
             z = self.transformer(z)
 
         # Pooling
-        if self.pooling == "attention":
+        if self.pooling == "style":
+            pred = self.style_pooling(z)  # [B, 2]
+            return {"valence_pred": pred[:, 0], "arousal_pred": pred[:, 1]}
+        elif self.pooling == "attention":
             attn_scores = self.attn_pool(z).squeeze(-1)  # [B, T]
             attn_weights = torch.softmax(attn_scores, dim=1)  # [B, T]
             z = (attn_weights.unsqueeze(-1) * z).sum(dim=1)  # [B, D]
@@ -261,11 +303,20 @@ class MultimodalEmotionModel(nn.Module):
 
         if self.use_mamba:
             z = self.mamba(z)  # [B, T, 256]
+        elif self.use_moe_mamba:
+            z = self.moe_mamba(z)  # [B, T, 256]
         elif self.use_transformer:
             z = self.transformer(z, mask=wavlm_mask)  # [B, T, 256]
 
         # Pooling (with mask support)
-        if self.pooling == "attention":
+        if self.pooling == "style":
+            # Style Pooling: concat pitch before pooling if needed
+            if self.use_pitch:
+                pitch = batch["pitch"].to(device)  # [B, T]
+                z = torch.cat([z, pitch.unsqueeze(-1)], dim=-1)  # [B, T, D+1]
+            pred = self.style_pooling(z, mask=wavlm_mask)  # [B, 2]
+            return {"valence_pred": pred[:, 0], "arousal_pred": pred[:, 1]}
+        elif self.pooling == "attention":
             attn_scores = self.attn_pool(z).squeeze(-1)  # [B, T]
             if wavlm_mask is not None:
                 attn_scores = attn_scores.masked_fill(wavlm_mask, float("-inf"))
@@ -288,3 +339,9 @@ class MultimodalEmotionModel(nn.Module):
 
         pred = self.prediction_head(z_final)  # [B, 2]
         return {"valence_pred": pred[:, 0], "arousal_pred": pred[:, 1]}
+
+    def get_aux_loss(self) -> torch.Tensor:
+        """Get auxiliary loss from MoE layers (for load balancing)."""
+        if self.use_moe_mamba and self.moe_mamba is not None:
+            return self.moe_mamba.get_aux_loss()
+        return torch.tensor(0.0)
